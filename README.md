@@ -68,6 +68,41 @@ Power sensing logic:
 - HIGH on `GPIO34` means power present
 - LOW on `GPIO34` means power lost
 
+## Board Wiring
+
+Actual perfboard wiring reference:
+
+![ESP32 UPS controller board wiring](./assets/1782849502688.png)
+
+This board is a compact ESP32 power-cut sensor built on a `6 cm x 8 cm` perfboard. The ESP32 reads a divided version of the USB `+5V` rail on `GPIO34` to decide whether mains-backed power is present, and it drives two status LEDs directly from GPIO pins.
+
+Connection summary:
+
+- `GPIO34`: divider sense input from the USB `+5V` line
+- `GPIO25`: green LED output
+- `GPIO26`: red LED output
+- `GND`: shared/common ground
+- `USB +5V`: source used for the divider input
+
+Divider network shown in the board image:
+
+- `1k` from ESP32-side sense trace into the divider node
+- `10k` from divider node to USB `+5V`
+- `15k` from divider node to `GND`
+
+LED wiring shown in the board image:
+
+- Green LED anode is driven from `GPIO25` through `220 ohm`
+- Red LED anode is driven from `GPIO26` through `220 ohm`
+- Both LED cathodes return to common ground
+
+Important notes for this build:
+
+- The LEDs are software-controlled and are not tied directly to the `+5V` rail
+- The `GPIO34` trace comes from the divider output, not directly from `+5V`
+- The divider output is approximately `3.0V` when USB `+5V` is present
+- `GPIO34` is input-only on ESP32, which makes it suitable for power sensing
+
 ## Project Layout
 
 ```text
