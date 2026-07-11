@@ -4,5 +4,6 @@ idf_component_register(
         "ups.c"
         "power_sensor.c"
         "leds.c"
+        "config.c"
     INCLUDE_DIRS "."
 )

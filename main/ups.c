@@ -1,86 +1,137 @@
 #include "ups.h"
 
-#include <stdio.h>
+#include <stdbool.h>
+#include <stdint.h>
 
+#include "config.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+
 #include "leds.h"
 #include "power_sensor.h"
 
 #define TAG "UPS"
-#define UPS_COUNTDOWN_SECONDS 10U
+
+typedef enum
+{
+    CONTROLLER_IDLE,
+    CONTROLLER_COUNTDOWN,
+    CONTROLLER_SHUTDOWN_SENT
+} controller_state_t;
+
+typedef struct
+{
+    power_state_t powerState;
+    controller_state_t controllerState;
+    TimerHandle_t shutdownTimer;
+} ups_controller_t;
 
 static ups_controller_t ups = {
     .powerState = POWER_UNKNOWN,
     .controllerState = CONTROLLER_IDLE,
-    .countdownStartTick = 0,
-    .countdownDurationTicks = 0,
-    .countdownSeconds = UPS_COUNTDOWN_SECONDS,
-    .lastReportedRemainingSeconds = 0,
-    .shutdownSent = false,
+    .shutdownTimer = NULL,
 };
+
+static portMUX_TYPE s_ups_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void on_power_lost(void);
+static void on_power_restored(void);
+static void handle_power_change(power_state_t state);
+static void start_countdown(void);
+static void cancel_countdown(void);
+static void shutdown_timer_cb(TimerHandle_t timer);
+
+static void shutdown_timer_cb(TimerHandle_t timer)
+{
+    (void)timer;
+
+    bool should_log = false;
+
+    portENTER_CRITICAL(&s_ups_lock);
+    if (ups.controllerState == CONTROLLER_COUNTDOWN)
+    {
+        ups.controllerState = CONTROLLER_SHUTDOWN_SENT;
+        should_log = true;
+    }
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    if (should_log)
+    {
+        ESP_LOGE(TAG, "Shutdown Triggered");
+    }
+}
 
 static void start_countdown(void)
 {
-    if (ups.controllerState != CONTROLLER_IDLE)
+    bool can_start = false;
+
+    portENTER_CRITICAL(&s_ups_lock);
+    if (ups.controllerState == CONTROLLER_IDLE)
+    {
+        ups.controllerState = CONTROLLER_COUNTDOWN;
+        can_start = true;
+    }
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    if (!can_start)
     {
         return;
     }
 
-    ups.controllerState = CONTROLLER_COUNTDOWN;
-    ups.shutdownSent = false;
-    ups.countdownStartTick = xTaskGetTickCount();
-    ups.countdownDurationTicks = pdMS_TO_TICKS(ups.countdownSeconds * 1000UL);
-    ups.lastReportedRemainingSeconds = ups.countdownSeconds;
+    TickType_t delay_ticks = pdMS_TO_TICKS(g_ups_config.shutdown_delay_seconds * 1000UL);
 
-    ESP_LOGW(TAG, "Shutdown countdown started (%lu s)", (unsigned long)ups.countdownSeconds);
-    ESP_LOGW(TAG, "Shutdown in %lu...", (unsigned long)ups.lastReportedRemainingSeconds);
+    if (xTimerChangePeriod(ups.shutdownTimer, delay_ticks, 0) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to arm shutdown timer");
+        portENTER_CRITICAL(&s_ups_lock);
+        ups.controllerState = CONTROLLER_IDLE;
+        portEXIT_CRITICAL(&s_ups_lock);
+        return;
+    }
+
+    if (xTimerStart(ups.shutdownTimer, 0) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to start shutdown timer");
+        portENTER_CRITICAL(&s_ups_lock);
+        ups.controllerState = CONTROLLER_IDLE;
+        portEXIT_CRITICAL(&s_ups_lock);
+        return;
+    }
+
+    ESP_LOGW(TAG, "Power LOST");
+    ESP_LOGW(TAG, "Shutdown countdown started (%lu s)",
+             (unsigned long)g_ups_config.shutdown_delay_seconds);
 }
 
 static void cancel_countdown(void)
 {
-    if (ups.controllerState != CONTROLLER_COUNTDOWN)
+    bool was_countdown = false;
+
+    portENTER_CRITICAL(&s_ups_lock);
+    if (ups.controllerState == CONTROLLER_COUNTDOWN)
+    {
+        ups.controllerState = CONTROLLER_IDLE;
+        was_countdown = true;
+    }
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    if (!was_countdown)
     {
         return;
     }
 
-    ups.controllerState = CONTROLLER_IDLE;
+    if (xTimerStop(ups.shutdownTimer, 0) != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to stop shutdown timer");
+    }
+
     ESP_LOGI(TAG, "Shutdown cancelled");
-}
-
-static void process_countdown(void)
-{
-    if (ups.controllerState != CONTROLLER_COUNTDOWN)
-    {
-        return;
-    }
-
-    TickType_t now = xTaskGetTickCount();
-    TickType_t elapsed = now - ups.countdownStartTick;
-
-    if (elapsed >= ups.countdownDurationTicks)
-    {
-        ups.controllerState = CONTROLLER_SHUTDOWN_SENT;
-        ups.shutdownSent = true;
-        ESP_LOGE(TAG, "Shutdown Triggered");
-        return;
-    }
-
-    TickType_t remainingTicks = ups.countdownDurationTicks - elapsed;
-    TickType_t oneSecondTicks = pdMS_TO_TICKS(1000);
-
-    uint32_t remainingSeconds = (uint32_t)((remainingTicks + oneSecondTicks - 1) / oneSecondTicks);
-
-    if (remainingSeconds != ups.lastReportedRemainingSeconds)
-    {
-        ups.lastReportedRemainingSeconds = remainingSeconds;
-        ESP_LOGW(TAG, "Shutdown in %lu...", (unsigned long)remainingSeconds);
-    }
 }
 
 static void on_power_lost(void)
 {
     leds_set_power_state(POWER_LOST);
-    ESP_LOGW(TAG, "Power LOST");
     start_countdown();
 }
 
@@ -89,32 +140,33 @@ static void on_power_restored(void)
     leds_set_power_state(POWER_PRESENT);
     ESP_LOGI(TAG, "Power RESTORED");
 
-    if (ups.controllerState == CONTROLLER_COUNTDOWN)
+    cancel_countdown();
+
+    portENTER_CRITICAL(&s_ups_lock);
+    if (ups.controllerState == CONTROLLER_SHUTDOWN_SENT)
     {
-        cancel_countdown();
-    }
-    else if (ups.controllerState == CONTROLLER_SHUTDOWN_SENT)
-    {
-        ESP_LOGI(TAG, "Power restored after shutdown trigger");
         ups.controllerState = CONTROLLER_IDLE;
-        ups.shutdownSent = false;
+        portEXIT_CRITICAL(&s_ups_lock);
+        ESP_LOGI(TAG, "Power restored after shutdown trigger");
+        return;
     }
+    portEXIT_CRITICAL(&s_ups_lock);
 }
 
 static void handle_power_change(power_state_t state)
 {
     switch (state)
     {
-        case POWER_PRESENT:
-            on_power_restored();
-            break;
+    case POWER_PRESENT:
+        on_power_restored();
+        break;
 
-        case POWER_LOST:
-            on_power_lost();
-            break;
+    case POWER_LOST:
+        on_power_lost();
+        break;
 
-        default:
-            break;
+    default:
+        break;
     }
 }
 
@@ -125,11 +177,15 @@ void ups_init(void)
 
     ups.powerState = POWER_UNKNOWN;
     ups.controllerState = CONTROLLER_IDLE;
-    ups.shutdownSent = false;
-    ups.countdownStartTick = 0;
-    ups.countdownDurationTicks = pdMS_TO_TICKS(UPS_COUNTDOWN_SECONDS * 1000UL);
-    ups.countdownSeconds = UPS_COUNTDOWN_SECONDS;
-    ups.lastReportedRemainingSeconds = 0;
+
+    ups.shutdownTimer = xTimerCreate(
+        "ups_shutdown",
+        pdMS_TO_TICKS(g_ups_config.shutdown_delay_seconds * 1000UL),
+        pdFALSE,
+        NULL,
+        shutdown_timer_cb);
+
+    configASSERT(ups.shutdownTimer != NULL);
 
     ESP_LOGI(TAG, "UPS controller initialized");
 }
@@ -143,6 +199,4 @@ void ups_update(void)
         ups.powerState = currentState;
         handle_power_change(currentState);
     }
-
-    process_countdown();
 }
