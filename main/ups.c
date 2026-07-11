@@ -11,6 +11,8 @@
 #include "leds.h"
 #include "power_sensor.h"
 
+#include "shutdown_client.h"
+
 #define TAG "UPS"
 
 typedef enum
@@ -46,19 +48,24 @@ static void shutdown_timer_cb(TimerHandle_t timer)
 {
     (void)timer;
 
-    bool should_log = false;
+    bool should_send = false;
 
     portENTER_CRITICAL(&s_ups_lock);
     if (ups.controllerState == CONTROLLER_COUNTDOWN)
     {
         ups.controllerState = CONTROLLER_SHUTDOWN_SENT;
-        should_log = true;
+        should_send = true;
     }
     portEXIT_CRITICAL(&s_ups_lock);
 
-    if (should_log)
+    if (should_send)
     {
         ESP_LOGE(TAG, "Shutdown Triggered");
+
+        if (shutdown_client_send() != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Shutdown request failed");
+        }
     }
 }
 

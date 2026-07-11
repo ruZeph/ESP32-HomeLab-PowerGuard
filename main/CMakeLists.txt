@@ -5,5 +5,7 @@ idf_component_register(
         "power_sensor.c"
         "leds.c"
         "config.c"
+        "wifi_manager.c"
+        "shutdown_client.c"
     INCLUDE_DIRS "."
 )

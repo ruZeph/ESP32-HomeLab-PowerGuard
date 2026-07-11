@@ -3,9 +3,12 @@
 
 #include "config.h"
 #include "ups.h"
+#include "wifi_manager.h"
 
 void app_main(void)
 {
+    wifi_manager_init();
+
     ups_init();
 
     while (1)
