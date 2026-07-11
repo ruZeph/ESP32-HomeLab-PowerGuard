@@ -78,4 +78,4 @@ Desktop.ini
 *.sln.docstates # Visual Studio
 
 # Config
-main/config.c
+main/config/config.c

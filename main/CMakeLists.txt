@@ -1,11 +1,17 @@
 idf_component_register(
     SRCS
-        "main.c"
-        "ups.c"
-        "power_sensor.c"
-        "leds.c"
-        "config.c"
-        "wifi_manager.c"
-        "shutdown_client.c"
-    INCLUDE_DIRS "."
+        "app/main.c"
+        "app/ups.c"
+        "config/config.c"
+        "drivers/leds.c"
+        "drivers/power_sensor.c"
+        "network/shutdown_client.c"
+        "network/wake_on_lan.c"
+        "network/wifi_manager.c"
+    INCLUDE_DIRS
+        "."
+        "app"
+        "config"
+        "drivers"
+        "network"
 )

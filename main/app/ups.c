@@ -12,6 +12,7 @@
 #include "power_sensor.h"
 
 #include "shutdown_client.h"
+#include "wake_on_lan.h"
 
 #define TAG "UPS"
 
@@ -19,7 +20,9 @@ typedef enum
 {
     CONTROLLER_IDLE,
     CONTROLLER_COUNTDOWN,
-    CONTROLLER_SHUTDOWN_SENT
+    CONTROLLER_WAITING_FOR_HOST_DOWN,
+    CONTROLLER_HOST_DOWN_WAITING_FOR_POWER,
+    CONTROLLER_WAITING_FOR_HOST_UP
 } controller_state_t;
 
 typedef struct
@@ -42,7 +45,12 @@ static void on_power_restored(void);
 static void handle_power_change(power_state_t state);
 static void start_countdown(void);
 static void cancel_countdown(void);
+static void send_wake_signal(void);
+static void process_host_state(void);
+static void log_host_wait_state(const char *message);
 static void shutdown_timer_cb(TimerHandle_t timer);
+
+static const char *s_last_host_wait_log = NULL;
 
 static void shutdown_timer_cb(TimerHandle_t timer)
 {
@@ -53,7 +61,7 @@ static void shutdown_timer_cb(TimerHandle_t timer)
     portENTER_CRITICAL(&s_ups_lock);
     if (ups.controllerState == CONTROLLER_COUNTDOWN)
     {
-        ups.controllerState = CONTROLLER_SHUTDOWN_SENT;
+        ups.controllerState = CONTROLLER_WAITING_FOR_HOST_DOWN;
         should_send = true;
     }
     portEXIT_CRITICAL(&s_ups_lock);
@@ -65,6 +73,13 @@ static void shutdown_timer_cb(TimerHandle_t timer)
         if (shutdown_client_send() != ESP_OK)
         {
             ESP_LOGE(TAG, "Shutdown request failed");
+
+            portENTER_CRITICAL(&s_ups_lock);
+            if (ups.controllerState == CONTROLLER_WAITING_FOR_HOST_DOWN)
+            {
+                ups.controllerState = CONTROLLER_IDLE;
+            }
+            portEXIT_CRITICAL(&s_ups_lock);
         }
     }
 }
@@ -136,6 +151,32 @@ static void cancel_countdown(void)
     ESP_LOGI(TAG, "Shutdown cancelled");
 }
 
+static void send_wake_signal(void)
+{
+    if (wake_on_lan_send(g_ups_config.wake_mac) != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to send Wake-on-LAN packet");
+        return;
+    }
+
+    portENTER_CRITICAL(&s_ups_lock);
+    ups.controllerState = CONTROLLER_WAITING_FOR_HOST_UP;
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    s_last_host_wait_log = NULL;
+}
+
+static void log_host_wait_state(const char *message)
+{
+    if (s_last_host_wait_log == message)
+    {
+        return;
+    }
+
+    s_last_host_wait_log = message;
+    ESP_LOGI(TAG, "%s", message);
+}
+
 static void on_power_lost(void)
 {
     leds_set_power_state(POWER_LOST);
@@ -150,14 +191,20 @@ static void on_power_restored(void)
     cancel_countdown();
 
     portENTER_CRITICAL(&s_ups_lock);
-    if (ups.controllerState == CONTROLLER_SHUTDOWN_SENT)
+    controller_state_t state = ups.controllerState;
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    if (state == CONTROLLER_WAITING_FOR_HOST_DOWN)
     {
-        ups.controllerState = CONTROLLER_IDLE;
-        portEXIT_CRITICAL(&s_ups_lock);
-        ESP_LOGI(TAG, "Power restored after shutdown trigger");
+        ESP_LOGI(TAG, "Power returned while shutdown is still in progress, Wake-on-LAN will wait");
         return;
     }
-    portEXIT_CRITICAL(&s_ups_lock);
+
+    if (state == CONTROLLER_HOST_DOWN_WAITING_FOR_POWER)
+    {
+        ESP_LOGI(TAG, "Power restored after confirmed shutdown, sending Wake-on-LAN");
+        send_wake_signal();
+    }
 }
 
 static void handle_power_change(power_state_t state)
@@ -174,6 +221,59 @@ static void handle_power_change(power_state_t state)
 
     default:
         break;
+    }
+}
+
+static void process_host_state(void)
+{
+    controller_state_t state;
+
+    portENTER_CRITICAL(&s_ups_lock);
+    state = ups.controllerState;
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    if (state == CONTROLLER_WAITING_FOR_HOST_DOWN)
+    {
+        host_reachability_t reachability = shutdown_client_check_host_reachability();
+
+        if (reachability == HOST_REACHABLE)
+        {
+            log_host_wait_state("Shutdown in progress, waiting for host to go offline");
+            return;
+        }
+
+        ESP_LOGI(TAG, "Host shutdown confirmed");
+        s_last_host_wait_log = NULL;
+
+        if (ups.powerState == POWER_PRESENT)
+        {
+            ESP_LOGI(TAG, "Power is back, sending Wake-on-LAN");
+            send_wake_signal();
+            return;
+        }
+
+        portENTER_CRITICAL(&s_ups_lock);
+        ups.controllerState = CONTROLLER_HOST_DOWN_WAITING_FOR_POWER;
+        portEXIT_CRITICAL(&s_ups_lock);
+        log_host_wait_state("Host is off, waiting for power restoration before Wake-on-LAN");
+        return;
+    }
+
+    if (state == CONTROLLER_WAITING_FOR_HOST_UP)
+    {
+        host_reachability_t reachability = shutdown_client_check_host_reachability();
+
+        if (reachability != HOST_REACHABLE)
+        {
+            log_host_wait_state("Wake sent, waiting for host health check to come back online");
+            return;
+        }
+
+        portENTER_CRITICAL(&s_ups_lock);
+        ups.controllerState = CONTROLLER_IDLE;
+        portEXIT_CRITICAL(&s_ups_lock);
+        s_last_host_wait_log = NULL;
+        ESP_LOGI(TAG, "Host is back online");
     }
 }
 
@@ -206,4 +306,6 @@ void ups_update(void)
         ups.powerState = currentState;
         handle_power_change(currentState);
     }
+
+    process_host_state();
 }
