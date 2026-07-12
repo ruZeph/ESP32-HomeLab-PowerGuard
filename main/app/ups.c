@@ -13,6 +13,7 @@
 
 #include "shutdown_client.h"
 #include "wake_on_lan.h"
+#include "wifi_manager.h"
 
 #define TAG "UPS"
 
@@ -30,12 +31,16 @@ typedef struct
     power_state_t powerState;
     controller_state_t controllerState;
     TimerHandle_t shutdownTimer;
+    TickType_t nextHostCheckTick;
+    bool startupRecoveryPending;
 } ups_controller_t;
 
 static ups_controller_t ups = {
     .powerState = POWER_UNKNOWN,
     .controllerState = CONTROLLER_IDLE,
     .shutdownTimer = NULL,
+    .nextHostCheckTick = 0,
+    .startupRecoveryPending = true,
 };
 
 static portMUX_TYPE s_ups_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -47,10 +52,14 @@ static void start_countdown(void);
 static void cancel_countdown(void);
 static void send_wake_signal(void);
 static void process_host_state(void);
+static void process_startup_recovery(void);
 static void log_host_wait_state(const char *message);
+static bool host_check_is_due(void);
+static void schedule_next_host_check(uint32_t delay_ms);
 static void shutdown_timer_cb(TimerHandle_t timer);
 
 static const char *s_last_host_wait_log = NULL;
+static const uint32_t HOST_CHECK_RETRY_INTERVAL_MS = 3000;
 
 static void shutdown_timer_cb(TimerHandle_t timer)
 {
@@ -163,6 +172,7 @@ static void send_wake_signal(void)
     ups.controllerState = CONTROLLER_WAITING_FOR_HOST_UP;
     portEXIT_CRITICAL(&s_ups_lock);
 
+    schedule_next_host_check(HOST_CHECK_RETRY_INTERVAL_MS);
     s_last_host_wait_log = NULL;
 }
 
@@ -175,6 +185,17 @@ static void log_host_wait_state(const char *message)
 
     s_last_host_wait_log = message;
     ESP_LOGI(TAG, "%s", message);
+}
+
+static bool host_check_is_due(void)
+{
+    TickType_t now = xTaskGetTickCount();
+    return now >= ups.nextHostCheckTick;
+}
+
+static void schedule_next_host_check(uint32_t delay_ms)
+{
+    ups.nextHostCheckTick = xTaskGetTickCount() + pdMS_TO_TICKS(delay_ms);
 }
 
 static void on_power_lost(void)
@@ -234,7 +255,13 @@ static void process_host_state(void)
 
     if (state == CONTROLLER_WAITING_FOR_HOST_DOWN)
     {
+        if (!host_check_is_due())
+        {
+            return;
+        }
+
         host_reachability_t reachability = shutdown_client_check_host_reachability();
+        schedule_next_host_check(HOST_CHECK_RETRY_INTERVAL_MS);
 
         if (reachability == HOST_REACHABLE)
         {
@@ -261,7 +288,13 @@ static void process_host_state(void)
 
     if (state == CONTROLLER_WAITING_FOR_HOST_UP)
     {
+        if (!host_check_is_due())
+        {
+            return;
+        }
+
         host_reachability_t reachability = shutdown_client_check_host_reachability();
+        schedule_next_host_check(HOST_CHECK_RETRY_INTERVAL_MS);
 
         if (reachability != HOST_REACHABLE)
         {
@@ -277,6 +310,35 @@ static void process_host_state(void)
     }
 }
 
+static void process_startup_recovery(void)
+{
+    if (!ups.startupRecoveryPending || ups.powerState != POWER_PRESENT)
+    {
+        return;
+    }
+
+    if (!wifi_manager_is_connected())
+    {
+        log_host_wait_state("Startup recovery pending, waiting for Wi-Fi before host check");
+        return;
+    }
+
+    host_reachability_t reachability = shutdown_client_check_host_reachability();
+
+    if (reachability == HOST_REACHABLE)
+    {
+        ups.startupRecoveryPending = false;
+        s_last_host_wait_log = NULL;
+        ESP_LOGI(TAG, "Startup recovery check: host is already online");
+        return;
+    }
+
+    ups.startupRecoveryPending = false;
+    s_last_host_wait_log = NULL;
+    ESP_LOGI(TAG, "Startup recovery check: host is offline while power is present, sending Wake-on-LAN");
+    send_wake_signal();
+}
+
 void ups_init(void)
 {
     power_sensor_init();
@@ -284,6 +346,8 @@ void ups_init(void)
 
     ups.powerState = POWER_UNKNOWN;
     ups.controllerState = CONTROLLER_IDLE;
+    ups.nextHostCheckTick = 0;
+    ups.startupRecoveryPending = true;
 
     ups.shutdownTimer = xTimerCreate(
         "ups_shutdown",
@@ -307,5 +371,6 @@ void ups_update(void)
         handle_power_change(currentState);
     }
 
+    process_startup_recovery();
     process_host_state();
 }

@@ -43,6 +43,7 @@ static void wifi_event_handler(void *arg,
         const wifi_event_sta_disconnected_t *disconnected = (const wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "Wi-Fi disconnected, reason=%d, retrying...", disconnected->reason);
         gpio_set_level(ONBOARD_LED, 0);
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         esp_wifi_connect();
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
@@ -99,4 +100,15 @@ void wifi_manager_init(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "Wi-Fi starting...");
+}
+
+bool wifi_manager_is_connected(void)
+{
+    if (s_wifi_event_group == NULL)
+    {
+        return false;
+    }
+
+    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+    return (bits & WIFI_CONNECTED_BIT) != 0;
 }
