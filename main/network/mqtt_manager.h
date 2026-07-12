@@ -1,0 +1,7 @@
+#pragma once
+
+void mqtt_manager_init(void);
+void mqtt_publish_power_state(const char *state);
+void mqtt_publish_host_state(const char *state);
+void mqtt_publish_countdown(const char *value);
+void mqtt_publish_last_event(const char *text);

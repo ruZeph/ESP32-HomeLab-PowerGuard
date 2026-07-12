@@ -4,10 +4,12 @@
 #include "config.h"
 #include "ups.h"
 #include "wifi_manager.h"
+#include "mqtt_manager.h"
 
 void app_main(void)
 {
     wifi_manager_init();
+    mqtt_manager_init();
 
     ups_init();
 

@@ -8,6 +8,7 @@ idf_component_register(
         "network/shutdown_client.c"
         "network/wake_on_lan.c"
         "network/wifi_manager.c"
+        "network/mqtt_manager.c"
     INCLUDE_DIRS
         "."
         "app"

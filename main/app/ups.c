@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "config.h"
 #include "esp_log.h"
@@ -11,6 +12,7 @@
 #include "leds.h"
 #include "power_sensor.h"
 
+#include "mqtt_manager.h"
 #include "shutdown_client.h"
 #include "wake_on_lan.h"
 #include "wifi_manager.h"
@@ -32,6 +34,7 @@ typedef struct
     controller_state_t controllerState;
     TimerHandle_t shutdownTimer;
     TickType_t nextHostCheckTick;
+    TickType_t countdownStartTick;
     bool startupRecoveryPending;
 } ups_controller_t;
 
@@ -49,7 +52,7 @@ static void on_power_lost(void);
 static void on_power_restored(void);
 static void handle_power_change(power_state_t state);
 static void start_countdown(void);
-static void cancel_countdown(void);
+
 static void send_wake_signal(void);
 static void process_host_state(void);
 static void process_startup_recovery(void);
@@ -78,6 +81,8 @@ static void shutdown_timer_cb(TimerHandle_t timer)
     if (should_send)
     {
         ESP_LOGE(TAG, "Shutdown Triggered");
+        mqtt_publish_countdown("0");
+        mqtt_publish_last_event("shutdown triggered");
 
         if (shutdown_client_send() != ESP_OK)
         {
@@ -130,12 +135,21 @@ static void start_countdown(void)
         return;
     }
 
+    ups.countdownStartTick = xTaskGetTickCount();
+
     ESP_LOGW(TAG, "Power LOST");
     ESP_LOGW(TAG, "Shutdown countdown started (%lu s)",
              (unsigned long)g_ups_config.shutdown_delay_seconds);
+
+    char secs[12];
+    snprintf(secs, sizeof(secs), "%lu",
+             (unsigned long)g_ups_config.shutdown_delay_seconds);
+    mqtt_publish_power_state("lost");
+    mqtt_publish_countdown(secs);
+    mqtt_publish_last_event("power lost, countdown started");
 }
 
-static void cancel_countdown(void)
+void ups_cancel_countdown(void)
 {
     bool was_countdown = false;
 
@@ -158,6 +172,8 @@ static void cancel_countdown(void)
     }
 
     ESP_LOGI(TAG, "Shutdown cancelled");
+    mqtt_publish_countdown("idle");
+    mqtt_publish_last_event("shutdown cancelled");
 }
 
 static void send_wake_signal(void)
@@ -174,6 +190,7 @@ static void send_wake_signal(void)
 
     schedule_next_host_check(HOST_CHECK_RETRY_INTERVAL_MS);
     s_last_host_wait_log = NULL;
+    mqtt_publish_last_event("WOL sent");
 }
 
 static void log_host_wait_state(const char *message)
@@ -208,8 +225,10 @@ static void on_power_restored(void)
 {
     leds_set_power_state(POWER_PRESENT);
     ESP_LOGI(TAG, "Power RESTORED");
+    mqtt_publish_power_state("online");
+    mqtt_publish_last_event("power restored");
 
-    cancel_countdown();
+    ups_cancel_countdown();
 
     portENTER_CRITICAL(&s_ups_lock);
     controller_state_t state = ups.controllerState;
@@ -271,6 +290,8 @@ static void process_host_state(void)
 
         ESP_LOGI(TAG, "Host shutdown confirmed");
         s_last_host_wait_log = NULL;
+        mqtt_publish_host_state("down");
+        mqtt_publish_last_event("host shutdown confirmed");
 
         if (ups.powerState == POWER_PRESENT)
         {
@@ -307,6 +328,9 @@ static void process_host_state(void)
         portEXIT_CRITICAL(&s_ups_lock);
         s_last_host_wait_log = NULL;
         ESP_LOGI(TAG, "Host is back online");
+        mqtt_publish_host_state("up");
+        mqtt_publish_countdown("idle");
+        mqtt_publish_last_event("host back online");
     }
 }
 
@@ -339,6 +363,39 @@ static void process_startup_recovery(void)
     send_wake_signal();
 }
 
+void ups_publish_current_state(void)
+{
+    if (ups.powerState == POWER_PRESENT)
+    {
+        mqtt_publish_power_state("online");
+    }
+    else if (ups.powerState == POWER_LOST)
+    {
+        mqtt_publish_power_state("lost");
+    }
+
+    portENTER_CRITICAL(&s_ups_lock);
+    controller_state_t ctrl = ups.controllerState;
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    if (ctrl == CONTROLLER_IDLE && !ups.startupRecoveryPending)
+    {
+        mqtt_publish_host_state("up");
+        mqtt_publish_countdown("idle");
+    }
+    else if (ctrl == CONTROLLER_HOST_DOWN_WAITING_FOR_POWER || ctrl == CONTROLLER_WAITING_FOR_HOST_UP)
+    {
+        mqtt_publish_host_state("down");
+        mqtt_publish_countdown("idle");
+    }
+    else if (ctrl == CONTROLLER_WAITING_FOR_HOST_DOWN)
+    {
+        mqtt_publish_host_state("up");
+        mqtt_publish_countdown("0");
+    }
+    // Note: if CONTROLLER_COUNTDOWN, the live loop will publish countdown on next tick
+}
+
 void ups_init(void)
 {
     power_sensor_init();
@@ -347,6 +404,7 @@ void ups_init(void)
     ups.powerState = POWER_UNKNOWN;
     ups.controllerState = CONTROLLER_IDLE;
     ups.nextHostCheckTick = 0;
+    ups.countdownStartTick = 0;
     ups.startupRecoveryPending = true;
 
     ups.shutdownTimer = xTimerCreate(
@@ -369,6 +427,23 @@ void ups_update(void)
     {
         ups.powerState = currentState;
         handle_power_change(currentState);
+    }
+
+    /* Publish live countdown while timer is running */
+    portENTER_CRITICAL(&s_ups_lock);
+    controller_state_t ctrl = ups.controllerState;
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    if (ctrl == CONTROLLER_COUNTDOWN)
+    {
+        TickType_t elapsed = xTaskGetTickCount() - ups.countdownStartTick;
+        uint32_t elapsed_s = (uint32_t)(elapsed / configTICK_RATE_HZ);
+        uint32_t total_s = g_ups_config.shutdown_delay_seconds;
+        uint32_t remaining = (elapsed_s < total_s) ? (total_s - elapsed_s) : 0;
+
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)remaining);
+        mqtt_publish_countdown(buf);
     }
 
     process_startup_recovery();

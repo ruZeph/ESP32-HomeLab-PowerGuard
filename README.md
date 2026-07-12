@@ -2,7 +2,7 @@
 
 ESP32-based power-loss controller for a homelab/server host.
 
-When AC power disappears, the controller starts a shutdown countdown. If the outage lasts long enough, it calls a host shutdown API, waits until the host is actually offline, and then stays quiet until power returns. When mains power comes back, it sends a Wake-on-LAN packet and waits for the host health check to recover.
+When AC power disappears, the controller starts a shutdown countdown. If the outage lasts long enough, it calls a host shutdown API, waits until the host is actually offline, and then stays quiet until power returns. When mains power comes back, it sends a Wake-on-LAN packet and waits for the host health check to recover. All state transitions are published to an MQTT broker for Home Assistant integration.
 
 ## Features
 
@@ -15,6 +15,10 @@ When AC power disappears, the controller starts a shutdown countdown. If the out
 - Sends Wake-on-LAN only after shutdown is confirmed
 - Polls a host health endpoint after wake until the server is back online
 - Suppresses repeated noisy logs once shutdown has already been confirmed
+- Reports state to Home Assistant via MQTT with auto-discovery
+- Accepts remote commands (cancel shutdown, force WOL) over MQTT
+- Publishes live shutdown countdown over MQTT
+- Uses MQTT Last Will and Testament for ESP32 availability tracking
 
 ## Current Host Flow
 
@@ -53,6 +57,44 @@ Normal sequence:
 Important behavior detail:
 
 - If power returns while the host is still shutting down, the ESP32 waits for shutdown confirmation before sending Wake-on-LAN. This avoids racing the host during power restoration.
+
+## MQTT / Home Assistant
+
+The controller connects to an MQTT broker and publishes state on every transition. Home Assistant auto-discovery payloads are sent on each MQTT connect, creating entities automatically.
+
+### Published Topics
+
+| Topic | Payload | Notes |
+|---|---|---|
+| `powerguard/power_state` | `"online"` / `"lost"` | Retained |
+| `powerguard/host_state` | `"up"` / `"down"` | Retained |
+| `powerguard/countdown` | Seconds remaining or `"idle"` | Updated every poll cycle during countdown |
+| `powerguard/last_event` | Free text, e.g. `"shutdown cancelled"` | Retained |
+| `powerguard/availability` | `"online"` / `"offline"` | LWT topic, retained. `"offline"` set by broker if ESP32 disconnects |
+
+The `availability` topic is the MQTT Last Will and Testament. Home Assistant uses it to distinguish "ESP32 itself is offline" from "mains power is lost" — these are different failure states.
+
+### Subscribed Topics (Commands)
+
+| Topic | Effect |
+|---|---|
+| `powerguard/command/cancel_shutdown` | Cancels an in-progress shutdown countdown (same as power restoration) |
+| `powerguard/command/force_wol` | Sends an immediate Wake-on-LAN packet regardless of controller state |
+
+### Home Assistant Discovery
+
+On connect, retained discovery config payloads are published for these entities:
+
+| Entity | HA Component | Device Class / Icon |
+|---|---|---|
+| Mains Power | `binary_sensor` | `power` |
+| Host Online | `binary_sensor` | `connectivity` |
+| Shutdown Countdown | `sensor` | `mdi:timer-alert-outline` |
+| Last Event | `sensor` | `mdi:message-text-clock-outline` |
+| Cancel Shutdown | `button` | `mdi:cancel` |
+| Force Wake-on-LAN | `button` | `mdi:power` |
+
+All entities are grouped under a single "PowerGuard" device in the HA UI, identified by the ESP32's MAC address.
 
 ## Hardware
 
@@ -120,12 +162,15 @@ main/
     power_sensor.c
     power_sensor.h
   network/
+    mqtt_manager.c
+    mqtt_manager.h
     shutdown_client.c
     shutdown_client.h
     wake_on_lan.c
     wake_on_lan.h
     wifi_manager.c
     wifi_manager.h
+  idf_component.yml  # managed component dependency (espressif/mqtt)
 ```
 
 ## Configuration
@@ -152,6 +197,10 @@ const ups_config_t g_ups_config = {
     .shutdown_url = "http://192.168.0.89:8787/api/v1/host/poweroff",
     .shutdown_bearer_token = "YOUR_TOKEN",
     .healthcheck_url = "http://192.168.0.89:8787/health",
+    .mqtt_broker_url = "mqtt://192.168.0.89",
+    .mqtt_port = 1883,
+    .mqtt_username = "esp32",
+    .mqtt_password = "YOUR_MQTT_PASSWORD",
 };
 ```
 
@@ -166,6 +215,10 @@ Configuration fields:
 - `shutdown_url`: host shutdown endpoint
 - `shutdown_bearer_token`: bearer token for shutdown authentication
 - `healthcheck_url`: host endpoint used to confirm down/up status
+- `mqtt_broker_url`: MQTT broker URI, e.g. `mqtt://192.168.0.89`
+- `mqtt_port`: MQTT broker port, typically `1883`
+- `mqtt_username`: MQTT username
+- `mqtt_password`: MQTT password (keep in gitignored `config.c`)
 
 ## Build and Flash
 
@@ -195,6 +248,11 @@ Typical useful logs:
 - `UPS: Host is off, waiting for power restoration before Wake-on-LAN`
 - `WOL: WOL packet sent to ...`
 - `UPS: Host is back online`
+- `MQTT: Connected to MQTT broker`
+- `MQTT: HA discovery payloads published`
+- `MQTT: Received cancel_shutdown command via MQTT`
+- `MQTT: Received force_wol command via MQTT`
+- `MQTT: Disconnected from MQTT broker`
 
 Expected temporary errors during shutdown or boot:
 
@@ -213,6 +271,7 @@ For reliable operation, the server should have:
 - Wake-on-LAN enabled in BIOS/UEFI
 - Wake-on-LAN enabled in the OS and NIC driver
 - UDP broadcast on port `9` allowed on the local network
+- An MQTT broker reachable on the LAN (e.g. Mosquitto on the Home Assistant host)
 
 ## Troubleshooting
 
@@ -243,6 +302,20 @@ If recovery feels slow:
 - This project currently uses a small native ESP-IDF Wake-on-LAN implementation in `main/network/wake_on_lan.c`.
 - The previously considered Arduino-oriented `a7md0/WakeOnLan` library was not integrated because this project is plain ESP-IDF, not Arduino.
 - Sensitive values should stay only in the ignored local config file.
+- MQTT uses the `espressif/mqtt` managed component, declared in `main/idf_component.yml`.
+
+If MQTT entities don't appear in Home Assistant:
+
+- Verify the MQTT broker is running and reachable from the ESP32's subnet
+- Verify `mqtt_username` and `mqtt_password` in `config.c`
+- Check that Home Assistant's MQTT integration has discovery enabled (it is by default)
+- Check serial logs for `MQTT: Connected to MQTT broker` and `MQTT: HA discovery payloads published`
+
+If MQTT commands don't work:
+
+- Verify subscription logs: `MQTT: Subscribed, msg_id=...`
+- Publish manually: `mosquitto_pub -t powerguard/command/force_wol -m test`
+- Check that the ESP32 is connected (availability topic should show `"online"`)
 
 ## License
 
