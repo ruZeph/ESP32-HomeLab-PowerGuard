@@ -24,6 +24,8 @@
 
 #define TOPIC_CMD_CANCEL     "powerguard/command/cancel_shutdown"
 #define TOPIC_CMD_FORCE_WOL  "powerguard/command/force_wol"
+#define TOPIC_CMD_FORCE_SHUTDOWN "powerguard/command/force_shutdown"
+#define TOPIC_CMD_CLEAR_LOG  "powerguard/command/clear_log"
 
 #define HA_DISCOVERY_PREFIX  "homeassistant"
 
@@ -123,6 +125,41 @@ static void publish_ha_discovery_sensor(
     publish(topic, payload, 1, 1);
 }
 
+static void publish_ha_discovery_json_sensor(
+    const char *object_id,
+    const char *name,
+    const char *state_topic,
+    const char *icon)
+{
+    char topic[128];
+    char payload[768];
+
+    snprintf(topic, sizeof(topic),
+             "%s/sensor/powerguard/%s/config",
+             HA_DISCOVERY_PREFIX, object_id);
+
+    snprintf(payload, sizeof(payload),
+             "{"
+             "\"name\":\"%s\","
+             "\"unique_id\":\"powerguard_%s_%s\","
+             "\"state_topic\":\"%s\","
+             "\"value_template\":\"{{ value_json.events | length }} events\","
+             "\"json_attributes_topic\":\"%s\","
+             "\"availability_topic\":\"" TOPIC_AVAILABILITY "\","
+             "\"icon\":\"%s\","
+             "\"device\":{"
+             "\"identifiers\":[\"powerguard_%s\"],"
+             "\"name\":\"PowerGuard\","
+             "\"manufacturer\":\"DIY\","
+             "\"model\":\"ESP32 UPS Controller\""
+             "}"
+             "}",
+             name, s_device_id, object_id, state_topic, state_topic, icon,
+             s_device_id);
+
+    publish(topic, payload, 1, 1);
+}
+
 static void publish_ha_discovery_button(
     const char *object_id,
     const char *name,
@@ -176,7 +213,7 @@ static void publish_ha_discovery(void)
         "last_event", "Last Event",
         TOPIC_LAST_EVENT, "mdi:message-text-clock-outline");
 
-    publish_ha_discovery_sensor(
+    publish_ha_discovery_json_sensor(
         "event_log", "Event Log",
         TOPIC_EVENT_LOG, "mdi:math-log");
 
@@ -187,6 +224,14 @@ static void publish_ha_discovery(void)
     publish_ha_discovery_button(
         "force_wol", "Force Wake-on-LAN",
         TOPIC_CMD_FORCE_WOL, "mdi:power");
+
+    publish_ha_discovery_button(
+        "force_shutdown", "Force Shutdown",
+        TOPIC_CMD_FORCE_SHUTDOWN, "mdi:power-plug-off");
+
+    publish_ha_discovery_button(
+        "clear_log", "Clear Event Log",
+        TOPIC_CMD_CLEAR_LOG, "mdi:delete-sweep");
 
     ESP_LOGI(TAG, "HA discovery payloads published");
 }
@@ -208,6 +253,23 @@ static void handle_command(const char *topic, int topic_len)
     {
         ESP_LOGI(TAG, "Received force_wol command via MQTT");
         wake_on_lan_send(g_ups_config.wake_mac);
+        return;
+    }
+
+    if (topic_len >= (int)strlen(TOPIC_CMD_FORCE_SHUTDOWN) &&
+        strstr(topic, "force_shutdown") != NULL)
+    {
+        ESP_LOGI(TAG, "Received force_shutdown command via MQTT");
+        ups_force_shutdown();
+        return;
+    }
+
+    if (topic_len >= (int)strlen(TOPIC_CMD_CLEAR_LOG) &&
+        strstr(topic, "clear_log") != NULL)
+    {
+        ESP_LOGI(TAG, "Received clear_log command via MQTT");
+        event_log_clear();
+        mqtt_publish_event_log();
         return;
     }
 
@@ -235,6 +297,8 @@ static void mqtt_event_handler(void *handler_args,
 
         esp_mqtt_client_subscribe(s_client, TOPIC_CMD_CANCEL, 1);
         esp_mqtt_client_subscribe(s_client, TOPIC_CMD_FORCE_WOL, 1);
+        esp_mqtt_client_subscribe(s_client, TOPIC_CMD_FORCE_SHUTDOWN, 1);
+        esp_mqtt_client_subscribe(s_client, TOPIC_CMD_CLEAR_LOG, 1);
 
         publish_ha_discovery();
         ups_publish_current_state();

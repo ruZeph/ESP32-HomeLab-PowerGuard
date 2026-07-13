@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "mqtt_manager.h"
+
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "nvs.h"
@@ -132,24 +134,27 @@ void event_log_record(event_type_t type, uint8_t extra)
              (unsigned long)uptime_s, event_type_str((uint8_t)type), extra);
 
     save_to_nvs();
+
+    mqtt_publish_event_log();
 }
 
 int event_log_format_json(char *buf, int buf_size)
 {
     if (buf_size < 3 || s_count == 0)
     {
-        if (buf_size >= 3)
+        if (buf_size >= 14)
         {
-            buf[0] = '[';
-            buf[1] = ']';
-            buf[2] = '\0';
-            return 2;
+            snprintf(buf, buf_size, "{\"events\":[]}");
+            return 13;
         }
         return 0;
     }
 
     int pos = 0;
-    buf[pos++] = '[';
+    int written = snprintf(buf + pos, buf_size - pos, "{\"events\":[");
+    if (written > 0) {
+        pos += written;
+    }
 
     /* Walk from oldest to newest */
     uint8_t start = (s_count < MAX_EVENTS) ? 0 : s_head;
@@ -178,7 +183,7 @@ int event_log_format_json(char *buf, int buf_size)
                                event_type_str(e->type));
         }
 
-        if (written < 0 || pos + written >= buf_size - 1)
+        if (written < 0 || pos + written >= buf_size - 2)
         {
             break;
         }
@@ -186,6 +191,7 @@ int event_log_format_json(char *buf, int buf_size)
     }
 
     buf[pos++] = ']';
+    buf[pos++] = '}';
     buf[pos]   = '\0';
     return pos;
 }

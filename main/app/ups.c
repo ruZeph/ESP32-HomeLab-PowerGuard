@@ -185,6 +185,44 @@ void ups_cancel_countdown(void)
     event_log_record(EVT_SHUTDOWN_CANCELLED, 0);
 }
 
+void ups_force_shutdown(void)
+{
+    bool should_send = false;
+
+    portENTER_CRITICAL(&s_ups_lock);
+    if (ups.controllerState == CONTROLLER_IDLE || ups.controllerState == CONTROLLER_COUNTDOWN)
+    {
+        if (ups.controllerState == CONTROLLER_COUNTDOWN)
+        {
+            xTimerStop(ups.shutdownTimer, 0);
+        }
+        ups.controllerState = CONTROLLER_WAITING_FOR_HOST_DOWN;
+        should_send = true;
+    }
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    if (should_send)
+    {
+        ESP_LOGE(TAG, "Manual Shutdown Triggered");
+        mqtt_publish_countdown("0");
+        mqtt_publish_last_event("manual shutdown triggered");
+        event_log_record(EVT_SHUTDOWN_TRIGGERED, 1);
+
+        if (shutdown_client_send() != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Manual Shutdown request failed");
+            event_log_record(EVT_SHUTDOWN_FAILED, 1);
+
+            portENTER_CRITICAL(&s_ups_lock);
+            if (ups.controllerState == CONTROLLER_WAITING_FOR_HOST_DOWN)
+            {
+                ups.controllerState = CONTROLLER_IDLE;
+            }
+            portEXIT_CRITICAL(&s_ups_lock);
+        }
+    }
+}
+
 static void send_wake_signal(void)
 {
     if (wake_on_lan_send(g_ups_config.wake_mac) != ESP_OK)

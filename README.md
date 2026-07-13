@@ -12,12 +12,14 @@ When AC power disappears, the controller starts a shutdown countdown. If the out
 - Delays shutdown to avoid reacting to short outages
 - Calls an authenticated HTTP shutdown endpoint
 - Confirms the host is really down before considering shutdown complete
-- Sends Wake-on-LAN only after shutdown is confirmed
+- Sends Wake-on-LAN only after shutdown is confirmed, with up to 20 automatic retries
 - Polls a host health endpoint after wake until the server is back online
 - Suppresses repeated noisy logs once shutdown has already been confirmed
+- Maintains a persistent 30-event ring buffer in NVS flash to survive sudden outages
 - Reports state to Home Assistant via MQTT with auto-discovery
-- Accepts remote commands (cancel shutdown, force WOL) over MQTT
+- Accepts remote commands (cancel shutdown, force WOL, force shutdown, clear log) over MQTT
 - Publishes live shutdown countdown over MQTT
+- Dumps full event log timeline to Home Assistant automatically on reconnect
 - Uses MQTT Last Will and Testament for ESP32 availability tracking
 
 ## Current Host Flow
@@ -70,6 +72,7 @@ The controller connects to an MQTT broker and publishes state on every transitio
 | `powerguard/host_state` | `"up"` / `"down"` | Retained |
 | `powerguard/countdown` | Seconds remaining or `"idle"` | Updated every poll cycle during countdown |
 | `powerguard/last_event` | Free text, e.g. `"shutdown cancelled"` | Retained |
+| `powerguard/event_log` | JSON array of last 30 events | Retained, automatically published on reconnect |
 | `powerguard/availability` | `"online"` / `"offline"` | LWT topic, retained. `"offline"` set by broker if ESP32 disconnects |
 
 The `availability` topic is the MQTT Last Will and Testament. Home Assistant uses it to distinguish "ESP32 itself is offline" from "mains power is lost" — these are different failure states.
@@ -80,6 +83,8 @@ The `availability` topic is the MQTT Last Will and Testament. Home Assistant use
 |---|---|
 | `powerguard/command/cancel_shutdown` | Cancels an in-progress shutdown countdown (same as power restoration) |
 | `powerguard/command/force_wol` | Sends an immediate Wake-on-LAN packet regardless of controller state |
+| `powerguard/command/force_shutdown`| Instantly aborts countdown and sends shutdown API request |
+| `powerguard/command/clear_log` | Erases the NVS flash event ring buffer and clears dashboard table |
 
 ### Home Assistant Discovery
 
@@ -91,10 +96,54 @@ On connect, retained discovery config payloads are published for these entities:
 | Host Online | `binary_sensor` | `connectivity` |
 | Shutdown Countdown | `sensor` | `mdi:timer-alert-outline` |
 | Last Event | `sensor` | `mdi:message-text-clock-outline` |
+| Event Log | `sensor` | `mdi:format-list-bulleted-type` |
 | Cancel Shutdown | `button` | `mdi:cancel` |
 | Force Wake-on-LAN | `button` | `mdi:power` |
+| Force Shutdown | `button` | `mdi:power-plug-off` |
+| Clear Event Log | `button` | `mdi:delete-sweep` |
 
 All entities are grouped under a single "PowerGuard" device in the HA UI, identified by the ESP32's MAC address.
+
+### Event Log Dashboard Card
+
+To visualize the persistent event log beautifully in Home Assistant, create a Markdown Card in your Lovelace dashboard and use the following Jinja template. It will automatically parse the `event_log` JSON, map events to nice emojis, and instantly auto-refresh whenever a new event occurs:
+
+```markdown
+<details open>
+<summary><b>Latest 30 Events (Click to collapse/expand)</b></summary>
+
+| ⏱️ Uptime | 📜 Event | ℹ️ Details |
+| :--- | :--- | :--- |
+{%- set events = state_attr('sensor.powerguard_event_log', 'events') %}
+{%- if events %}
+{%- for evt in events | reverse %}
+  {%- set type_map = {
+    'ESP_BOOTED': '🟢 System Boot',
+    'POWER_LOST': '🔴 Power Lost',
+    'POWER_RESTORED': '⚡ Power Restored',
+    'SHUTDOWN_TRIGGERED': '💀 Shutdown Triggered',
+    'SHUTDOWN_FAILED': '❌ Shutdown Failed',
+    'SHUTDOWN_CANCELLED': '🛑 Shutdown Cancelled',
+    'HOST_DOWN_CONFIRMED': '📴 Host Offline',
+    'HOST_BACK_ONLINE': '🚀 Host Back Online',
+    'WOL_SENT': '📡 WOL Sent',
+    'WOL_RETRY': '🔄 WOL Retry',
+    'WOL_FAILED': '⚠️ WOL Failed'
+  } %}
+  {%- set evt_name = type_map.get(evt.e, evt.e) %}
+  {%- set h = (evt.t / 3600) | int %}
+  {%- set m = ((evt.t % 3600) / 60) | int %}
+  {%- set s = evt.t % 60 %}
+  {%- set t_str = "%02d:%02d:%02d" | format(h, m, s) %}
+| `{{ t_str }}` | **{{ evt_name }}** | {{ evt.x | default('-') }} |
+{%- endfor %}
+{%- else %}
+| - | No events recorded | - |
+{%- endif %}
+
+</details>
+<span style="display:none">{{ states('sensor.powerguard_last_event') }}</span>
+```
 
 ## Hardware
 
