@@ -12,6 +12,7 @@
 #include "leds.h"
 #include "power_sensor.h"
 
+#include "event_log.h"
 #include "mqtt_manager.h"
 #include "shutdown_client.h"
 #include "wake_on_lan.h"
@@ -34,7 +35,9 @@ typedef struct
     controller_state_t controllerState;
     TimerHandle_t shutdownTimer;
     TickType_t nextHostCheckTick;
+    TickType_t nextWolRetryTick;
     TickType_t countdownStartTick;
+    uint32_t wolRetriesSent;
     bool startupRecoveryPending;
 } ups_controller_t;
 
@@ -63,6 +66,8 @@ static void shutdown_timer_cb(TimerHandle_t timer);
 
 static const char *s_last_host_wait_log = NULL;
 static const uint32_t HOST_CHECK_RETRY_INTERVAL_MS = 3000;
+static const uint32_t WOL_RETRY_INTERVAL_MS = 5000;
+static const uint32_t MAX_WOL_RETRIES = 20;
 
 static void shutdown_timer_cb(TimerHandle_t timer)
 {
@@ -83,10 +88,12 @@ static void shutdown_timer_cb(TimerHandle_t timer)
         ESP_LOGE(TAG, "Shutdown Triggered");
         mqtt_publish_countdown("0");
         mqtt_publish_last_event("shutdown triggered");
+        event_log_record(EVT_SHUTDOWN_TRIGGERED, 0);
 
         if (shutdown_client_send() != ESP_OK)
         {
             ESP_LOGE(TAG, "Shutdown request failed");
+            event_log_record(EVT_SHUTDOWN_FAILED, 0);
 
             portENTER_CRITICAL(&s_ups_lock);
             if (ups.controllerState == CONTROLLER_WAITING_FOR_HOST_DOWN)
@@ -147,6 +154,7 @@ static void start_countdown(void)
     mqtt_publish_power_state("lost");
     mqtt_publish_countdown(secs);
     mqtt_publish_last_event("power lost, countdown started");
+    event_log_record(EVT_POWER_LOST, 0);
 }
 
 void ups_cancel_countdown(void)
@@ -174,6 +182,7 @@ void ups_cancel_countdown(void)
     ESP_LOGI(TAG, "Shutdown cancelled");
     mqtt_publish_countdown("idle");
     mqtt_publish_last_event("shutdown cancelled");
+    event_log_record(EVT_SHUTDOWN_CANCELLED, 0);
 }
 
 static void send_wake_signal(void)
@@ -181,6 +190,7 @@ static void send_wake_signal(void)
     if (wake_on_lan_send(g_ups_config.wake_mac) != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to send Wake-on-LAN packet");
+        event_log_record(EVT_WOL_FAILED, 0);
         return;
     }
 
@@ -188,9 +198,12 @@ static void send_wake_signal(void)
     ups.controllerState = CONTROLLER_WAITING_FOR_HOST_UP;
     portEXIT_CRITICAL(&s_ups_lock);
 
+    ups.wolRetriesSent = 1;
+    ups.nextWolRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(WOL_RETRY_INTERVAL_MS);
     schedule_next_host_check(HOST_CHECK_RETRY_INTERVAL_MS);
     s_last_host_wait_log = NULL;
     mqtt_publish_last_event("WOL sent");
+    event_log_record(EVT_WOL_SENT, 0);
 }
 
 static void log_host_wait_state(const char *message)
@@ -227,6 +240,7 @@ static void on_power_restored(void)
     ESP_LOGI(TAG, "Power RESTORED");
     mqtt_publish_power_state("online");
     mqtt_publish_last_event("power restored");
+    event_log_record(EVT_POWER_RESTORED, 0);
 
     ups_cancel_countdown();
 
@@ -292,6 +306,7 @@ static void process_host_state(void)
         s_last_host_wait_log = NULL;
         mqtt_publish_host_state("down");
         mqtt_publish_last_event("host shutdown confirmed");
+        event_log_record(EVT_HOST_DOWN_CONFIRMED, 0);
 
         if (ups.powerState == POWER_PRESENT)
         {
@@ -309,6 +324,21 @@ static void process_host_state(void)
 
     if (state == CONTROLLER_WAITING_FOR_HOST_UP)
     {
+        /* Retry WOL periodically in case the first packet was lost */
+        TickType_t now = xTaskGetTickCount();
+        if (ups.wolRetriesSent < MAX_WOL_RETRIES && now >= ups.nextWolRetryTick)
+        {
+            ESP_LOGI(TAG, "WOL retry %lu/%lu",
+                     (unsigned long)(ups.wolRetriesSent + 1),
+                     (unsigned long)MAX_WOL_RETRIES);
+            event_log_record(EVT_WOL_RETRY, ups.wolRetriesSent + 1);
+            if (wake_on_lan_send(g_ups_config.wake_mac) == ESP_OK)
+            {
+                ups.wolRetriesSent++;
+            }
+            ups.nextWolRetryTick = now + pdMS_TO_TICKS(WOL_RETRY_INTERVAL_MS);
+        }
+
         if (!host_check_is_due())
         {
             return;
@@ -331,6 +361,7 @@ static void process_host_state(void)
         mqtt_publish_host_state("up");
         mqtt_publish_countdown("idle");
         mqtt_publish_last_event("host back online");
+        event_log_record(EVT_HOST_BACK_ONLINE, 0);
     }
 }
 
@@ -417,6 +448,7 @@ void ups_init(void)
     configASSERT(ups.shutdownTimer != NULL);
 
     ESP_LOGI(TAG, "UPS controller initialized");
+    event_log_record(EVT_ESP_BOOTED, 0);
 }
 
 void ups_update(void)

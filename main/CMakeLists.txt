@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "app/main.c"
         "app/ups.c"
+        "app/event_log.c"
         "config/config.c"
         "drivers/leds.c"
         "drivers/power_sensor.c"

@@ -9,6 +9,7 @@
 #include "esp_mac.h"
 #include "mqtt_client.h"
 
+#include "event_log.h"
 #include "ups.h"
 #include "wake_on_lan.h"
 
@@ -18,6 +19,7 @@
 #define TOPIC_HOST_STATE     "powerguard/host_state"
 #define TOPIC_COUNTDOWN      "powerguard/countdown"
 #define TOPIC_LAST_EVENT     "powerguard/last_event"
+#define TOPIC_EVENT_LOG      "powerguard/event_log"
 #define TOPIC_AVAILABILITY   "powerguard/availability"
 
 #define TOPIC_CMD_CANCEL     "powerguard/command/cancel_shutdown"
@@ -174,6 +176,10 @@ static void publish_ha_discovery(void)
         "last_event", "Last Event",
         TOPIC_LAST_EVENT, "mdi:message-text-clock-outline");
 
+    publish_ha_discovery_sensor(
+        "event_log", "Event Log",
+        TOPIC_EVENT_LOG, "mdi:math-log");
+
     publish_ha_discovery_button(
         "cancel_shutdown", "Cancel Shutdown",
         TOPIC_CMD_CANCEL, "mdi:cancel");
@@ -232,6 +238,7 @@ static void mqtt_event_handler(void *handler_args,
 
         publish_ha_discovery();
         ups_publish_current_state();
+        mqtt_publish_event_log();
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -311,4 +318,15 @@ void mqtt_publish_countdown(const char *value)
 void mqtt_publish_last_event(const char *text)
 {
     publish(TOPIC_LAST_EVENT, text, 1, 1);
+}
+
+void mqtt_publish_event_log(void)
+{
+    static char log_buf[2048];
+    int len = event_log_format_json(log_buf, sizeof(log_buf));
+    if (len > 0)
+    {
+        publish(TOPIC_EVENT_LOG, log_buf, 1, 1);
+        ESP_LOGI(TAG, "Event log published (%d bytes)", len);
+    }
 }
