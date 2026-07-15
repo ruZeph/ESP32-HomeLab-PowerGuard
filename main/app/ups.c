@@ -38,6 +38,8 @@ typedef struct
     TickType_t nextWolRetryTick;
     TickType_t countdownStartTick;
     uint32_t wolRetriesSent;
+    uint32_t shutdownRetriesSent;
+    TickType_t nextShutdownRetryTick;
     bool startupRecoveryPending;
 } ups_controller_t;
 
@@ -46,6 +48,9 @@ static ups_controller_t ups = {
     .controllerState = CONTROLLER_IDLE,
     .shutdownTimer = NULL,
     .nextHostCheckTick = 0,
+    .nextWolRetryTick = 0,
+    .shutdownRetriesSent = 0,
+    .nextShutdownRetryTick = 0,
     .startupRecoveryPending = true,
 };
 
@@ -90,17 +95,16 @@ static void shutdown_timer_cb(TimerHandle_t timer)
         mqtt_publish_last_event("shutdown triggered");
         event_log_record(EVT_SHUTDOWN_TRIGGERED, 0);
 
+        ups.shutdownRetriesSent = 0;
+        ups.nextShutdownRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
+
         if (shutdown_client_send() != ESP_OK)
         {
             ESP_LOGE(TAG, "Shutdown request failed");
             event_log_record(EVT_SHUTDOWN_FAILED, 0);
-
-            portENTER_CRITICAL(&s_ups_lock);
-            if (ups.controllerState == CONTROLLER_WAITING_FOR_HOST_DOWN)
-            {
-                ups.controllerState = CONTROLLER_IDLE;
-            }
-            portEXIT_CRITICAL(&s_ups_lock);
+            /* Do not revert to IDLE here! The host might still be shutting down 
+               since it drops the HTTP connection instantly. Let process_host_state 
+               confirm whether the host goes down or stays up. */
         }
     }
 }
@@ -208,17 +212,14 @@ void ups_force_shutdown(void)
         mqtt_publish_last_event("manual shutdown triggered");
         event_log_record(EVT_SHUTDOWN_TRIGGERED, 1);
 
+        ups.shutdownRetriesSent = 0;
+        ups.nextShutdownRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
+
         if (shutdown_client_send() != ESP_OK)
         {
             ESP_LOGE(TAG, "Manual Shutdown request failed");
             event_log_record(EVT_SHUTDOWN_FAILED, 1);
-
-            portENTER_CRITICAL(&s_ups_lock);
-            if (ups.controllerState == CONTROLLER_WAITING_FOR_HOST_DOWN)
-            {
-                ups.controllerState = CONTROLLER_IDLE;
-            }
-            portEXIT_CRITICAL(&s_ups_lock);
+            /* Do not revert to IDLE here, let process_host_state handle it */
         }
     }
 }
@@ -336,6 +337,27 @@ static void process_host_state(void)
 
         if (reachability == HOST_REACHABLE)
         {
+            if (power_sensor_read() == POWER_PRESENT)
+            {
+                ESP_LOGI(TAG, "Power is back and host never went offline. Aborting shutdown wait.");
+                portENTER_CRITICAL(&s_ups_lock);
+                ups.controllerState = CONTROLLER_IDLE;
+                portEXIT_CRITICAL(&s_ups_lock);
+                return;
+            }
+
+            TickType_t now = xTaskGetTickCount();
+            if (now >= ups.nextShutdownRetryTick)
+            {
+                ups.shutdownRetriesSent++;
+                ESP_LOGW(TAG, "Host still reachable, retrying shutdown command (%lu)", (unsigned long)ups.shutdownRetriesSent);
+                if (shutdown_client_send() != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "Shutdown retry failed");
+                }
+                ups.nextShutdownRetryTick = now + pdMS_TO_TICKS(15000);
+            }
+
             log_host_wait_state("Shutdown in progress, waiting for host to go offline");
             return;
         }
@@ -346,7 +368,7 @@ static void process_host_state(void)
         mqtt_publish_last_event("host shutdown confirmed");
         event_log_record(EVT_HOST_DOWN_CONFIRMED, 0);
 
-        if (ups.powerState == POWER_PRESENT)
+        if (power_sensor_read() == POWER_PRESENT)
         {
             ESP_LOGI(TAG, "Power is back, sending Wake-on-LAN");
             send_wake_signal();

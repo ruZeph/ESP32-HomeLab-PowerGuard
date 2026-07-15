@@ -20,6 +20,7 @@
 #define TOPIC_COUNTDOWN      "powerguard/countdown"
 #define TOPIC_LAST_EVENT     "powerguard/last_event"
 #define TOPIC_EVENT_LOG      "powerguard/event_log"
+#define TOPIC_TOTAL_POWERCUTS "powerguard/total_powercuts"
 #define TOPIC_AVAILABILITY   "powerguard/availability"
 
 #define TOPIC_CMD_CANCEL     "powerguard/command/cancel_shutdown"
@@ -217,6 +218,10 @@ static void publish_ha_discovery(void)
         "event_log", "Event Log",
         TOPIC_EVENT_LOG, "mdi:math-log");
 
+    publish_ha_discovery_sensor(
+        "total_powercuts", "Total Powercuts",
+        TOPIC_TOTAL_POWERCUTS, "mdi:flash-off");
+
     publish_ha_discovery_button(
         "cancel_shutdown", "Cancel Shutdown",
         TOPIC_CMD_CANCEL, "mdi:cancel");
@@ -240,32 +245,32 @@ static void publish_ha_discovery(void)
 
 static void handle_command(const char *topic, int topic_len)
 {
-    if (topic_len >= (int)strlen(TOPIC_CMD_CANCEL) &&
-        strstr(topic, "cancel_shutdown") != NULL)
+    if (topic_len == (int)strlen(TOPIC_CMD_CANCEL) &&
+        strncmp(topic, TOPIC_CMD_CANCEL, topic_len) == 0)
     {
         ESP_LOGI(TAG, "Received cancel_shutdown command via MQTT");
         ups_cancel_countdown();
         return;
     }
 
-    if (topic_len >= (int)strlen(TOPIC_CMD_FORCE_WOL) &&
-        strstr(topic, "force_wol") != NULL)
+    if (topic_len == (int)strlen(TOPIC_CMD_FORCE_WOL) &&
+        strncmp(topic, TOPIC_CMD_FORCE_WOL, topic_len) == 0)
     {
         ESP_LOGI(TAG, "Received force_wol command via MQTT");
         wake_on_lan_send(g_ups_config.wake_mac);
         return;
     }
 
-    if (topic_len >= (int)strlen(TOPIC_CMD_FORCE_SHUTDOWN) &&
-        strstr(topic, "force_shutdown") != NULL)
+    if (topic_len == (int)strlen(TOPIC_CMD_FORCE_SHUTDOWN) &&
+        strncmp(topic, TOPIC_CMD_FORCE_SHUTDOWN, topic_len) == 0)
     {
         ESP_LOGI(TAG, "Received force_shutdown command via MQTT");
         ups_force_shutdown();
         return;
     }
 
-    if (topic_len >= (int)strlen(TOPIC_CMD_CLEAR_LOG) &&
-        strstr(topic, "clear_log") != NULL)
+    if (topic_len == (int)strlen(TOPIC_CMD_CLEAR_LOG) &&
+        strncmp(topic, TOPIC_CMD_CLEAR_LOG, topic_len) == 0)
     {
         ESP_LOGI(TAG, "Received clear_log command via MQTT");
         event_log_clear();
@@ -303,6 +308,7 @@ static void mqtt_event_handler(void *handler_args,
         publish_ha_discovery();
         ups_publish_current_state();
         mqtt_publish_event_log();
+        mqtt_publish_powercut_count();
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -393,4 +399,11 @@ void mqtt_publish_event_log(void)
         publish(TOPIC_EVENT_LOG, log_buf, 1, 1);
         ESP_LOGI(TAG, "Event log published (%d bytes)", len);
     }
+}
+
+void mqtt_publish_powercut_count(void)
+{
+    char payload[16];
+    snprintf(payload, sizeof(payload), "%lu", (unsigned long)event_log_get_powercut_count());
+    publish(TOPIC_TOTAL_POWERCUTS, payload, 1, 1);
 }

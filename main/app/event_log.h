@@ -46,3 +46,8 @@ int event_log_format_json(char *buf, int buf_size);
  * Call after a successful publish to start fresh.
  */
 void event_log_clear(void);
+
+/**
+ * Get the total number of power cuts recorded since device was first flashed.
+ */
+uint32_t event_log_get_powercut_count(void);
