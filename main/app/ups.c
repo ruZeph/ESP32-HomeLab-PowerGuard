@@ -445,6 +445,7 @@ static void process_startup_recovery(void)
         ups.startupRecoveryPending = false;
         s_last_host_wait_log = NULL;
         ESP_LOGI(TAG, "Startup recovery check: host is already online");
+        ups_publish_current_state();
         return;
     }
 
@@ -452,6 +453,7 @@ static void process_startup_recovery(void)
     s_last_host_wait_log = NULL;
     ESP_LOGI(TAG, "Startup recovery check: host is offline while power is present, sending Wake-on-LAN");
     send_wake_signal();
+    ups_publish_current_state();
 }
 
 void ups_publish_current_state(void)
