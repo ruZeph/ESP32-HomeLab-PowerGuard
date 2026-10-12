@@ -397,7 +397,10 @@ void mqtt_publish_last_event(const char *text)
 
 void mqtt_publish_event_log(void)
 {
-    static char log_buf[2048];
+    /* Sized for the worst case of 30 events each carrying an optional "x" and
+       a 26-character "ts": about 2.4 KB. At 2048 the tail of the array would
+       silently not fit and events would be dropped from the payload. */
+    static char log_buf[4096];
     int len = event_log_format_json(log_buf, sizeof(log_buf));
     if (len > 0)
     {

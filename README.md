@@ -530,6 +530,30 @@ Waiting-state messages such as `Shutdown in progress, waiting for host to go off
 
 `EVTLOG: [t=<uptime seconds>] <EVENT> (extra=<n>)` prints each recorded event. `extra` carries context such as the Wake-on-LAN retry number, or `0` when unused.
 
+The same events are published as JSON on `powerguard/event_log`, which is the payload other systems consume:
+
+```json
+{
+  "events": [
+    {"t":0,"e":"ESP_BOOTED"},
+    {"t":37,"e":"HOST_BACK_ONLINE","x":9,"ts":"2026-10-12T14:14:00Z"}
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `t` | Device **uptime in seconds**, not a timestamp. Resets to 0 on every boot. The ordering key within a boot. |
+| `e` | Event name from the table below. |
+| `x` | Optional context byte. **Omitted entirely when zero** — absent means 0. |
+| `ts` | Optional UTC time the event happened, ISO-8601. **Omitted when the clock was not set.** |
+
+Notes on `ts`:
+
+- It is present only for events recorded after SNTP has synchronised, so boot events at `t=0`/`t=1` never carry one. This is deliberate: a timestamp taken before sync is wrong, and omitting is better than publishing a wrong time.
+- It is **not persisted**. The NVS blob stores only uptime, so the stored format does not change and events written by an older firmware are never misread after an update. After a reboot, entries restored from NVS until the next sync have no `ts`.
+- It exists for the case where the network was unavailable when the event happened, such as during an outage. Those events are republished on reconnect, and a receiver stamping arrival time would record them minutes or hours late. `ts` carries the real time.
+
 | Event | Meaning |
 |---|---|
 | `ESP_BOOTED` | Controller started |

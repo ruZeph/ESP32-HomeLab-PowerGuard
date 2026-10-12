@@ -2,8 +2,10 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "mqtt_manager.h"
+#include "time_sync.h"
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -32,6 +34,13 @@ static nvs_event_t s_events[MAX_EVENTS];
 static uint8_t     s_count = 0;
 static uint8_t     s_head  = 0;
 static uint32_t    s_powercut_count = 0;
+
+/* Wall-clock time each ring entry was recorded, kept in RAM only. The NVS blob
+   still stores just the uptime, so its layout does not change and events
+   written by an older firmware are never misread after an update. Entries
+   loaded from NVS after a reboot have no known epoch, so "ts" is omitted for
+   them instead of being guessed. */
+static time_t      s_event_epoch[MAX_EVENTS];
 
 /* Mutex protecting the ring buffer and NVS from concurrent access.
    event_log_record() can be called from the FreeRTOS timer task (shutdown_timer_cb)
@@ -143,6 +152,10 @@ void event_log_record(event_type_t type, uint8_t extra)
     s_events[s_head].type     = (uint8_t)type;
     s_events[s_head].extra    = extra;
 
+    /* Only meaningful once SNTP has set the clock. Left at 0 before that so the
+       field is omitted rather than published wrong. */
+    s_event_epoch[s_head] = time_sync_is_valid() ? time(NULL) : 0;
+
     s_head = (s_head + 1) % MAX_EVENTS;
     if (s_count < MAX_EVENTS)
     {
@@ -206,23 +219,39 @@ int event_log_format_json(char *buf, int buf_size)
         uint8_t idx = (start + i) % MAX_EVENTS;
         const nvs_event_t *e = &s_events[idx];
 
+        char ts_frag[40] = "";
+        if (s_event_epoch[idx] != 0)
+        {
+            struct tm recorded_utc;
+            if (gmtime_r(&s_event_epoch[idx], &recorded_utc) != NULL)
+            {
+                char iso[24];
+                if (strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &recorded_utc) > 0)
+                {
+                    snprintf(ts_frag, sizeof(ts_frag), ",\"ts\":\"%s\"", iso);
+                }
+            }
+        }
+
         int written;
         if (e->extra != 0)
         {
             written = snprintf(buf + pos, buf_size - pos,
-                               "%s{\"t\":%lu,\"e\":\"%s\",\"x\":%u}",
+                               "%s{\"t\":%lu,\"e\":\"%s\",\"x\":%u%s}",
                                (i > 0) ? "," : "",
                                (unsigned long)e->uptime_s,
                                event_type_str(e->type),
-                               e->extra);
+                               e->extra,
+                               ts_frag);
         }
         else
         {
             written = snprintf(buf + pos, buf_size - pos,
-                               "%s{\"t\":%lu,\"e\":\"%s\"}",
+                               "%s{\"t\":%lu,\"e\":\"%s\"%s}",
                                (i > 0) ? "," : "",
                                (unsigned long)e->uptime_s,
-                               event_type_str(e->type));
+                               event_type_str(e->type),
+                               ts_frag);
         }
 
         if (written < 0 || pos + written >= buf_size - 2)
@@ -251,6 +280,7 @@ void event_log_clear(void)
     }
 
     memset(s_events, 0, sizeof(s_events));
+    memset(s_event_epoch, 0, sizeof(s_event_epoch));
     s_count = 0;
     s_head  = 0;
     // Note: We intentionally do NOT reset s_powercut_count when clearing the log buffer.
