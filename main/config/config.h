@@ -25,6 +25,7 @@ typedef struct
     const char *ota_bearer_token;     // Token required on OTA requests, NULL to allow without auth
 
     const char *ntp_server;           // NTP host for the wall clock, NULL uses pool.ntp.org
+    const char *device_hostname;      // DHCP hostname, NULL uses "powerguard"
 } ups_config_t;
 
 extern const ups_config_t g_ups_config;

@@ -279,6 +279,7 @@ const ups_config_t g_ups_config = {
     .ota_port = 3232,
     .ota_bearer_token = "YOUR_OTA_TOKEN",
     .ntp_server = "pool.ntp.org",
+    .device_hostname = "powerguard",
 };
 ```
 
@@ -300,6 +301,7 @@ Configuration fields:
 - `ota_port`: LAN OTA HTTP server port, `0` uses the default `3232`
 - `ota_bearer_token`: token required on OTA requests, leave `NULL` only on a trusted network
 - `ntp_server`: NTP host used for the wall clock, `NULL` uses `pool.ntp.org`. Set this if the LAN has no internet or runs its own NTP server
+- `device_hostname`: DHCP hostname, `NULL` uses `powerguard`. Every ESP32 otherwise presents the ESP-IDF default `espressif`, which a second board would silently take over. Note that a **static DHCP reservation on the router takes precedence** over this value
 
 ## Build and Flash
 

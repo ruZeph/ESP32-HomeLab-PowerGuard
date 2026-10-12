@@ -61,7 +61,29 @@ void wifi_manager_init(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     ESP_ERROR_CHECK(nvs_flash_init());
-    esp_netif_create_default_wifi_sta();
+
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+    /* Every ESP32 defaults to the hostname "espressif", so the router would
+       publish espressif.lan and a second board would silently take the name
+       over. Set a unique one before the first DHCP request. */
+    const char *hostname = (g_ups_config.device_hostname != NULL &&
+                            g_ups_config.device_hostname[0] != '\0')
+                               ? g_ups_config.device_hostname
+                               : "powerguard";
+
+    if (sta_netif != NULL)
+    {
+        esp_err_t hostname_err = esp_netif_set_hostname(sta_netif, hostname);
+        if (hostname_err == ESP_OK)
+        {
+            ESP_LOGI(TAG, "DHCP hostname set to '%s'", hostname);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Could not set hostname '%s': %s", hostname, esp_err_to_name(hostname_err));
+        }
+    }
 
     s_wifi_event_group = xEventGroupCreate();
     onboard_led_init();
