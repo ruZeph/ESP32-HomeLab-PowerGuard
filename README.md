@@ -63,6 +63,21 @@ Important behavior detail:
 - A health check only counts as "host is up" when it returns HTTP `2xx`. A `4xx`/`5xx` response is treated as the host not being healthy, so a broken health endpoint cannot keep the controller waiting indefinitely.
 - Shutdown requests are retried every `15 s` for up to 20 attempts. After that the controller backs off to one attempt every 5 minutes and records a `SHUTDOWN_FAILED` event, because the host is still running with power out and continuing to try matters more than giving up.
 
+### Timing characteristics
+
+Power state is sampled every `power_poll_interval_ms` (100 ms), but **not while a host HTTP check is in flight**. The controller's HTTP calls are synchronous, so in the `WAITING_FOR_HOST_DOWN`, `WAITING_FOR_HOST_UP` and startup-recovery states the main loop can block for up to `health_check_timeout_ms` (10 s) per attempt. Because host checks are also rate-limited to one every 3 s, the effective sampling cadence in those states is roughly 13 s rather than 100 ms, so a mains transition during that window is noticed late by up to about 10 s.
+
+The impact is bounded rather than dangerous, and two things it does *not* do are worth stating because they are easy to assume:
+
+- It does not starve the idle task. The block is a socket wait, so the CPU is yielded and the task watchdog is satisfied.
+- It does not risk a stack overflow. Measured on hardware, the whole `esp_http_client_perform` path peaks at roughly 1.1 KB of stack, which fits both the 3.5 KB main task and the 2 KB FreeRTOS timer task.
+
+**Do not shorten `health_check_timeout_ms` to reduce this window.** A timeout that is too short makes a slow-but-healthy host look unreachable, and the controller treats unreachable as *shutdown confirmed*, which can produce a spurious Wake-on-LAN while the host is still running. The generous timeout exists to avoid that false negative — removing the blind window properly would mean moving the HTTP calls to a dedicated task.
+
+One related characteristic: the shutdown POST is issued from the FreeRTOS timer callback, so it briefly occupies the timer service task for up to its 5 s timeout. Only one software timer is used in this project, so the practical effect is small.
+
+The countdown is published only when the remaining second changes, so the 100 ms poll loop does not generate 10 messages per second of MQTT traffic.
+
 ## MQTT / Home Assistant
 
 The controller connects to an MQTT broker and publishes state on every transition. Home Assistant auto-discovery payloads are sent on each MQTT connect, creating entities automatically.
