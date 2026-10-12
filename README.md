@@ -242,6 +242,11 @@ main/
     wifi_manager.c
     wifi_manager.h
   idf_component.yml  # managed component dependency (espressif/mqtt)
+main/certs/
+    poweroff_ca.pem  # CA pinned for the HTTPS shutdown endpoint
+deploy/
+    Caddyfile        # TLS termination in front of the shutdown API
+    generate-certs.sh
 partitions.csv       # OTA partition layout
 sdkconfig.defaults   # partition table and rollback defaults
 ```
@@ -631,6 +636,50 @@ The cost is permanent and the protection is partial, so the risk is accepted.
 
 Disabling `CONFIG_ESP_WIFI_NVS_ENABLED` to avoid the second copy of the PSK is not a good trade either: it also stops PHY calibration data being cached, which costs boot time and adds flash wear on every start.
 
+### Putting the shutdown API behind TLS
+
+The bearer token authorises a host poweroff and travels in a plain header. Over plain HTTP anything on the LAN can read it and replay it forever. Terminating TLS in front of the shutdown API fixes that: the token is encrypted in transit and an active attacker cannot tamper with the request.
+
+```text
+ESP32 --HTTPS--> Caddy :443 --loopback--> 127.0.0.1:8787
+```
+
+Firmware support is built in. Both `shutdown_url` and `healthcheck_url` accept `https://`, and the CA is pinned from `main/certs/poweroff_ca.pem`, which is embedded into the image at build time.
+
+**Do these steps in order.** Switching the URL to `https` before the proxy and CA are in place makes shutdown fail, and you would not find out until an outage:
+
+1. On the host, generate the certificates:
+   ```sh
+   ./deploy/generate-certs.sh 192.168.0.89
+   ```
+2. Copy the resulting CA into the firmware repo:
+   ```sh
+   cp deploy/out/powerguard-ca.crt main/certs/poweroff_ca.pem
+   ```
+3. Terminate TLS. `deploy/Caddyfile` is a working starting point; point it at `deploy/out/powerguard-server.{crt,key}` and bind the shutdown service to `127.0.0.1` so it cannot still be reached in plaintext.
+4. Confirm the proxy from another machine:
+   ```sh
+   openssl s_client -connect 192.168.0.89:443 -CAfile deploy/out/powerguard-ca.crt
+   ```
+   You want `Verify return code: 0 (ok)`.
+5. Only now switch the URLs in `config.c`, rebuild and flash:
+   ```c
+   .shutdown_url = "https://192.168.0.89/api/v1/host/poweroff",
+   .healthcheck_url = "https://192.168.0.89/health",
+   ```
+6. Check the boot log. It reports both schemes and warns when the CA is unusable:
+   ```text
+   I (521) SHUTDOWN: Shutdown endpoint: https, health endpoint: https
+   ```
+   No `plain HTTP` warning and no `Embedded CA is not a usable CA` warning means TLS is active and the pinned CA parsed correctly.
+
+Notes:
+
+- The CA certificate is public and safe to commit. `powerguard-ca.key` and `powerguard-server.key` are not: keep them on the host and out of git.
+- The committed `main/certs/poweroff_ca.pem` is a placeholder whose private key was discarded, so it can never verify anything. The boot log says so until you replace it.
+- Rotate the bearer token after switching: it was exposed in plaintext beforehand, and turning on TLS does not undo that.
+- On Windows, the bundled `curl` uses Schannel and can reject an internal CA that OpenSSL happily verifies. Use `openssl s_client` to check the chain.
+
 ### Mitigations used instead
 
 | Control | Status |
@@ -639,7 +688,7 @@ Disabling `CONFIG_ESP_WIFI_NVS_ENABLED` to avoid the second copy of the PSK is n
 | Scoped MQTT credentials | Recommended: a dedicated MQTT user restricted to `powerguard/#` |
 | Network separation | Recommended: a separate SSID/VLAN so a leaked Wi-Fi PSK does not grant main-LAN access |
 | Credential rotation | Rotate the Wi-Fi PSK, MQTT password and `shutdown_bearer_token` if they have ever been shared |
-| Shutdown request replay | **Not yet mitigated.** The token travels over plaintext HTTP and is replayable indefinitely. Signing the request with an HMAC over a timestamp and nonce would remove that |
+| Shutdown token in transit | **Supported, not yet enabled.** Put the shutdown API behind TLS using `deploy/`; until `shutdown_url` is switched to `https://` with a pinned CA, the token still crosses the LAN in clear text |
 
 ## Notes
 

@@ -1,0 +1,45 @@
+# Caddy configuration that puts the PowerGuard shutdown API behind TLS.
+#
+# Why: the ESP32 sends its bearer token in a plain Authorization header. Over
+# plain HTTP that token is readable by anything on the LAN and can be replayed
+# forever. Terminating TLS here encrypts it in transit, so a passive sniffer
+# gets nothing usable and an active attacker cannot tamper with the request.
+#
+# Bind the shutdown service itself to 127.0.0.1 so it cannot be reached in
+# plaintext while this proxy is up.
+#
+#   ESP32 --HTTPS--> Caddy :443 --loopback--> 127.0.0.1:8787
+#
+# Replace the address below with the host's IP or hostname. The certificate
+# must cover it; deploy/generate-certs.sh puts the IP in the SAN.
+
+{
+	# The local admin API is not needed for this workload.
+	admin off
+}
+
+https://192.168.0.89 {
+	# Certificates produced by deploy/generate-certs.sh. Caddy cannot use its
+	# automatic HTTPS here because the ESP32 has to pin a known CA.
+	tls /etc/caddy/powerguard/powerguard-server.crt /etc/caddy/powerguard/powerguard-server.key
+
+	reverse_proxy 127.0.0.1:8787 {
+		# The host may be about to power off, so do not hold connections open.
+		transport http {
+			read_timeout 10s
+			write_timeout 10s
+		}
+	}
+
+	log {
+		output file /var/log/caddy/powerguard.log
+		# Record only method, path and status. The Authorization header must
+		# never reach a log file.
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+			}
+		}
+	}
+}
