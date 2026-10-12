@@ -120,6 +120,15 @@ host_reachability_t shutdown_client_check_host_reachability(void)
         return HOST_UNREACHABLE_ERROR;
     }
 
-    ESP_LOGI(TAG, "Health check responded with HTTP status = %d", status);
-    return HOST_REACHABLE;
+    if (status >= 200 && status < 300)
+    {
+        ESP_LOGI(TAG, "Health check responded with HTTP status = %d", status);
+        return HOST_REACHABLE;
+    }
+
+    /* The service answered but says it is not healthy, which is not the same
+       as the host being up. Treating any response as "reachable" leaves a
+       failing health endpoint looking like a healthy host forever. */
+    ESP_LOGW(TAG, "Health check returned HTTP status = %d, treating host as not healthy", status);
+    return HOST_UNREACHABLE_ERROR;
 }

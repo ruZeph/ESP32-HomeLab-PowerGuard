@@ -60,6 +60,8 @@ Normal sequence:
 Important behavior detail:
 
 - If power returns while the host is still shutting down, the ESP32 waits for shutdown confirmation before sending Wake-on-LAN. This avoids racing the host during power restoration.
+- A health check only counts as "host is up" when it returns HTTP `2xx`. A `4xx`/`5xx` response is treated as the host not being healthy, so a broken health endpoint cannot keep the controller waiting indefinitely.
+- Shutdown requests are retried every `15 s` for up to 20 attempts. After that the controller backs off to one attempt every 5 minutes and records a `SHUTDOWN_FAILED` event, because the host is still running with power out and continuing to try matters more than giving up.
 
 ## MQTT / Home Assistant
 
@@ -364,6 +366,8 @@ curl -X POST -H "Authorization: Bearer YOUR_OTA_TOKEN" \
 
 When `ota_bearer_token` is `NULL` or empty, uploads are accepted from anyone on the LAN and the firmware logs `OTA bearer token is not configured, uploads are unauthenticated` at boot. That is acceptable on a trusted network only.
 
+Set this in any deployment you care about: without it, any host on the LAN can replace the firmware, and the image is not signature-checked either.
+
 ### Safety behaviour
 
 - **Rollback.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is enabled, so an updated image boots in `PENDING_VERIFY` state. `ota_manager_init()` confirms it with `esp_ota_mark_app_valid_cancel_rollback()` as soon as `app_main()` gets past `wifi_manager_init()`. An image that never gets that far is reverted by the bootloader on the next reset.
@@ -473,7 +477,10 @@ Reading the reason code:
 | `UPS: Shutdown cancelled` | Power returned before the countdown expired |
 | `UPS: Shutdown Triggered` | Countdown expired, shutdown API called |
 | `UPS: Shutdown request failed` | Shutdown API call failed; state is confirmed by polling the host |
-| `UPS: Host shutdown confirmed` | Health endpoint stopped responding |
+| `UPS: Host still reachable, retrying shutdown command (N)` | Shutdown retry, `15 s` cadence |
+| `UPS: Host still reachable after 20 shutdown attempts, backing off to every 300 s` | Retry cap reached, switching to the slow cadence |
+| `SHUTDOWN: Health check returned HTTP status = N, treating host as not healthy` | Health endpoint answered but was not `2xx` |
+| `UPS: Host shutdown confirmed` | Health endpoint stopped responding or stopped returning `2xx` |
 | `UPS: Host is off, waiting for power restoration before Wake-on-LAN` | Shutdown done, waiting for mains |
 | `UPS: Host is back online` | Health endpoint recovered after Wake-on-LAN |
 | `UPS: Startup recovery check: ...` | Boot-time host reconciliation after a reset |

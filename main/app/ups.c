@@ -74,6 +74,16 @@ static const uint32_t HOST_CHECK_RETRY_INTERVAL_MS = 3000;
 static const uint32_t WOL_RETRY_INTERVAL_MS = 5000;
 static const uint32_t MAX_WOL_RETRIES = 20;
 
+/* After this many 15 s shutdown retries the controller stops hammering the
+   host but keeps trying on a slow cadence: power is out and the host is still
+   up, so giving up entirely would be worse than retrying less often. */
+static const uint32_t MAX_SHUTDOWN_RETRIES = 20;
+static const uint32_t SHUTDOWN_RETRY_BACKOFF_MS = 300000;
+
+/* Remaining seconds most recently published, so the countdown is only sent
+   when the value changes. UINT32_MAX means nothing has been published yet. */
+static uint32_t s_last_published_countdown = UINT32_MAX;
+
 static void shutdown_timer_cb(TimerHandle_t timer)
 {
     (void)timer;
@@ -350,12 +360,32 @@ static void process_host_state(void)
             if (now >= ups.nextShutdownRetryTick)
             {
                 ups.shutdownRetriesSent++;
-                ESP_LOGW(TAG, "Host still reachable, retrying shutdown command (%lu)", (unsigned long)ups.shutdownRetriesSent);
+
+                uint32_t retry_interval_ms = 15000;
+
+                if (ups.shutdownRetriesSent > MAX_SHUTDOWN_RETRIES)
+                {
+                    retry_interval_ms = SHUTDOWN_RETRY_BACKOFF_MS;
+
+                    if (ups.shutdownRetriesSent == MAX_SHUTDOWN_RETRIES + 1)
+                    {
+                        ESP_LOGE(TAG, "Host still reachable after %lu shutdown attempts, backing off to every %lu s",
+                                 (unsigned long)MAX_SHUTDOWN_RETRIES,
+                                 (unsigned long)(SHUTDOWN_RETRY_BACKOFF_MS / 1000));
+                        mqtt_publish_last_event("shutdown retries exhausted");
+                        event_log_record(EVT_SHUTDOWN_FAILED, 2);
+                    }
+                }
+                else
+                {
+                    ESP_LOGW(TAG, "Host still reachable, retrying shutdown command (%lu)", (unsigned long)ups.shutdownRetriesSent);
+                }
+
                 if (shutdown_client_send() != ESP_OK)
                 {
                     ESP_LOGE(TAG, "Shutdown retry failed");
                 }
-                ups.nextShutdownRetryTick = now + pdMS_TO_TICKS(15000);
+                ups.nextShutdownRetryTick = now + pdMS_TO_TICKS(retry_interval_ms);
             }
 
             log_host_wait_state("Shutdown in progress, waiting for host to go offline");
@@ -534,7 +564,10 @@ void ups_update(void)
         handle_power_change(currentState);
     }
 
-    /* Publish live countdown while timer is running */
+    /* Publish the live countdown, but only when the remaining second changes.
+       This loop runs every power_poll_interval_ms (100 ms), so publishing
+       unconditionally would push ~10 identical messages per second for the
+       whole countdown. */
     portENTER_CRITICAL(&s_ups_lock);
     controller_state_t ctrl = ups.controllerState;
     portEXIT_CRITICAL(&s_ups_lock);
@@ -546,9 +579,17 @@ void ups_update(void)
         uint32_t total_s = g_ups_config.shutdown_delay_seconds;
         uint32_t remaining = (elapsed_s < total_s) ? (total_s - elapsed_s) : 0;
 
-        char buf[12];
-        snprintf(buf, sizeof(buf), "%lu", (unsigned long)remaining);
-        mqtt_publish_countdown(buf);
+        if (remaining != s_last_published_countdown)
+        {
+            char buf[12];
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)remaining);
+            mqtt_publish_countdown(buf);
+            s_last_published_countdown = remaining;
+        }
+    }
+    else
+    {
+        s_last_published_countdown = UINT32_MAX;
     }
 
     process_startup_recovery();

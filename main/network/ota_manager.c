@@ -34,6 +34,27 @@ static uint16_t ota_port(void)
     return (uint16_t)(g_ups_config.ota_port != 0 ? g_ups_config.ota_port : OTA_DEFAULT_PORT);
 }
 
+/* Compares without an early exit so the time taken does not reveal how many
+   leading characters of the token matched. */
+static bool constant_time_equals(const char *a, const char *b)
+{
+    size_t len_a = strlen(a);
+    size_t len_b = strlen(b);
+
+    if (len_a != len_b)
+    {
+        return false;
+    }
+
+    unsigned char diff = 0;
+    for (size_t i = 0; i < len_a; ++i)
+    {
+        diff |= (unsigned char)(a[i] ^ b[i]);
+    }
+
+    return diff == 0;
+}
+
 static bool upload_is_authorised(httpd_req_t *req)
 {
     const char *token = g_ups_config.ota_bearer_token;
@@ -56,7 +77,7 @@ static bool upload_is_authorised(httpd_req_t *req)
         return false;
     }
 
-    return strcmp(received, expected) == 0;
+    return constant_time_equals(received, expected);
 }
 
 static void publish_status(const char *state)
