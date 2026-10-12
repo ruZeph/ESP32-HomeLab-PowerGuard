@@ -604,6 +604,43 @@ If recovery feels slow:
 - Lower `power_poll_interval_ms`
 - Lower `health_check_timeout_ms`
 
+## Security Notes
+
+### Threat model
+
+The controller is assumed to live on a trusted LAN inside a trusted building. The realistic threats, in rough order of likelihood:
+
+1. A leaked or over-shared credential (Wi-Fi PSK, MQTT password, `shutdown_bearer_token`).
+2. Sniffing or replay of the plaintext HTTP shutdown request on the LAN.
+3. Unauthorised firmware replacement through the OTA endpoint.
+4. Someone with physical access reading the flash directly.
+
+Item 4 is deliberately accepted rather than mitigated.
+
+### Flash encryption is deliberately not enabled
+
+Enabling flash encryption was considered and rejected. It is not a setting that can be undone:
+
+- **Release mode is permanent.** Only release mode meaningfully protects anything, and moving to it burns eFuses via `esp_flash_encryption_set_release_mode()`. Development mode can be reversed, but only **three times per chip** on the original ESP32.
+- **It needs secure boot to be worth anything.** ESP-IDF states that "flash encryption alone may not prevent an attacker from modifying the firmware", and secure boot is irreversible.
+- **It is unsafe on this specific device.** ESP-IDF documents that interrupting power during the first-boot encryption pass corrupts the flash contents. A UPS controller is precisely the device whose power rail is expected to brown out.
+- **It would not protect the Wi-Fi password anyway.** NVS partitions cannot be encrypted by flash encryption, and the Wi-Fi driver persists the PSK into NVS (`nvs.net80211` / `sta.pswd`) because `CONFIG_ESP_WIFI_NVS_ENABLED=y`. Burning permanent eFuses would still leave a plaintext copy of the PSK on the flash. Closing that would need NVS encryption, which itself requires flash encryption or a permanently burned HMAC eFuse key.
+- **An accidental plaintext flash soft-bricks the device.**
+
+The cost is permanent and the protection is partial, so the risk is accepted.
+
+Disabling `CONFIG_ESP_WIFI_NVS_ENABLED` to avoid the second copy of the PSK is not a good trade either: it also stops PHY calibration data being cached, which costs boot time and adds flash wear on every start.
+
+### Mitigations used instead
+
+| Control | Status |
+|---|---|
+| OTA bearer token | Enforced when `ota_bearer_token` is set, compared without an early exit |
+| Scoped MQTT credentials | Recommended: a dedicated MQTT user restricted to `powerguard/#` |
+| Network separation | Recommended: a separate SSID/VLAN so a leaked Wi-Fi PSK does not grant main-LAN access |
+| Credential rotation | Rotate the Wi-Fi PSK, MQTT password and `shutdown_bearer_token` if they have ever been shared |
+| Shutdown request replay | **Not yet mitigated.** The token travels over plaintext HTTP and is replayable indefinitely. Signing the request with an HMAC over a timestamp and nonce would remove that |
+
 ## Notes
 
 - This project currently uses a small native ESP-IDF Wake-on-LAN implementation in `main/network/wake_on_lan.c`.
