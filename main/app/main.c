@@ -10,9 +10,13 @@
 
 void app_main(void)
 {
-    ota_manager_init();
     event_log_init();
     wifi_manager_init();
+
+    /* Must come after wifi_manager_init(): httpd_start() opens a listening
+       socket, so the lwIP stack has to exist first. */
+    ota_manager_init();
+
     mqtt_manager_init();
 
     ups_init();

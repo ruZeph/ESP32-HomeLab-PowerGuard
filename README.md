@@ -366,7 +366,7 @@ When `ota_bearer_token` is `NULL` or empty, uploads are accepted from anyone on 
 
 ### Safety behaviour
 
-- **Rollback.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is enabled, so an updated image boots in `PENDING_VERIFY` state. `ota_manager_init()` confirms it with `esp_ota_mark_app_valid_cancel_rollback()` as soon as the application starts. An image that never gets that far is reverted by the bootloader on the next reset.
+- **Rollback.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is enabled, so an updated image boots in `PENDING_VERIFY` state. `ota_manager_init()` confirms it with `esp_ota_mark_app_valid_cancel_rollback()` as soon as `app_main()` gets past `wifi_manager_init()`. An image that never gets that far is reverted by the bootloader on the next reset.
 - **Boot partition is set last.** `esp_ota_set_boot_partition()` only runs after the whole image is written and validated, so an interrupted transfer leaves the running image bootable.
 - **Power events block updates.** While a shutdown countdown or wake sequence is in progress the upload is rejected with `503 Service Unavailable`, because rebooting the controller would discard that state and the host would neither be shut down nor woken.
 - **One update at a time.** A second concurrent upload is rejected with `503 Service Unavailable`.
@@ -397,23 +397,28 @@ Remaining tags in the monitor output (`boot`, `esp_image`, `wifi`, `phy_init`, `
 ### Healthy Boot Sequence
 
 ```text
-I (443) boot: Loaded app from partition at offset 0x10000
+I (420) boot: Loaded app from partition at offset 0x20000
 I (467) app_init: Project name:     UPS_Controller_ESP32
 I (536) spi_flash: detected chip: ...
 I (543) main_task: Calling app_main()
-I (573) EVTLOG: Loaded 30 events from NVS
-I (773) wifi:mode : sta (xx:xx:xx:xx:xx:xx)
-I (773) WIFI: Wi-Fi starting...
-I (803) EVTLOG: [t=0] ESP_BOOTED (extra=0)
-I (803) UPS: UPS controller initialized
-I (823) MQTT: MQTT client starting, broker=mqtt://<broker>:1883
-I (xxxx) WIFI: Wi-Fi connected
-I (xxxx) MQTT: Connected to MQTT broker
-I (xxxx) MQTT: Subscribed, msg_id=...
-I (xxxx) MQTT: HA discovery payloads published
+I (549) EVTLOG: Loaded 30 events from NVS
+I (739) WIFI: Wi-Fi starting...
+I (749) OTA: Running image confirmed, rollback cancelled
+W (1179) OTA: OTA bearer token is not configured, uploads are unauthenticated
+I (1179) OTA: OTA server listening on port 3232, firmware <ver> on partition 'ota_0'
+I (1469) MQTT: MQTT client starting, broker=mqtt://<broker>:1883
+I (1469) UPS: UPS controller initialized
+I (1479) EVTLOG: [t=0] ESP_BOOTED (extra=0)
+I (4449) WIFI: Wi-Fi connected, IP: 192.168.0.176
+I (5149) UPS: Startup recovery check: host is already online
+I (16318) MQTT: Connected to MQTT broker
+I (16348) MQTT: Subscribed, msg_id=...
+I (16388) MQTT: HA discovery payloads published
 ```
 
-`app_main()` starts Wi-Fi and MQTT back to back, so the MQTT client is created before Wi-Fi has an IP address. The first broker attempts therefore fail with `esp-tls: connect() error: Host is unreachable` and `MQTT: Disconnected from MQTT broker` until association completes. This is expected with the current startup order and resolves itself once Wi-Fi connects.
+`app_main()` starts Wi-Fi and the OTA server before MQTT, so the MQTT client is created before Wi-Fi has an IP address. The first broker attempts therefore fail with `esp-tls: connect() error: Host is unreachable` and `MQTT: Disconnected from MQTT broker` until association completes, which is why the broker session only appears around 16 s. This is expected with the current startup order and resolves itself once Wi-Fi connects.
+
+The OTA server must be started after `wifi_manager_init()`, because `httpd_start()` opens a listening socket and needs the lwIP stack to exist first.
 
 ### Wi-Fi Disconnect Reasons
 
@@ -507,6 +512,7 @@ Waiting-state messages such as `Shutdown in progress, waiting for host to go off
 | `OTA: Rejected update: controller is handling a power event` | Refused because a shutdown or wake sequence is in progress |
 | `OTA: Image too large: N bytes, partition 'ota_1' holds N` | Image exceeds the staging slot |
 | `OTA: Update interrupted after N of M bytes` | Client disconnected mid-transfer, staging slot abandoned |
+| `OTA: Flash write failed: ...` | Payload is not a valid application image, rejected while writing |
 | `OTA: Image validation failed` | Uploaded data is not a valid application image |
 
 ### Expected Errors During Shutdown or Boot
@@ -547,6 +553,7 @@ If an OTA upload is rejected:
 - `401` means `ota_bearer_token` is set and the `Authorization: Bearer <token>` header is missing or wrong.
 - `503` means either an upload is already running or the controller is mid-shutdown/mid-wake. Retry once the UPS state is idle.
 - `413` means the image is bigger than the 1856K slot, which normally means the wrong file was passed.
+- `500` with `Flash write failed` means the payload is not a valid application image. ESP-IDF verifies the image incrementally while writing, so a wrong or truncated file is rejected early and the running firmware is left untouched.
 - `Content-Length required` means the body was sent without a length, for example as a chunked upload. Use `curl --data-binary` as shown in the OTA section.
 
 If an OTA update succeeds but the device comes back on the old firmware:
