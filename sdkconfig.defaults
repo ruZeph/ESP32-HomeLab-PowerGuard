@@ -16,3 +16,8 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 # The controller is station-only and never brings up a SoftAP interface.
 # CONFIG_ESP_WIFI_SOFTAP_SUPPORT is not set
+
+# SNTP starts before the first DHCP lease exists, so the initial request can
+# fail. Retry every minute instead of every hour so the clock appears shortly
+# after boot rather than an hour later. The traffic is negligible.
+CONFIG_LWIP_SNTP_UPDATE_DELAY=60000

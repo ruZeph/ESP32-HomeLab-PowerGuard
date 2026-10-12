@@ -23,6 +23,8 @@ typedef struct
 
     uint32_t    ota_port;             // LAN OTA HTTP port, 0 uses the default 3232
     const char *ota_bearer_token;     // Token required on OTA requests, NULL to allow without auth
+
+    const char *ntp_server;           // NTP host for the wall clock, NULL uses pool.ntp.org
 } ups_config_t;
 
 extern const ups_config_t g_ups_config;

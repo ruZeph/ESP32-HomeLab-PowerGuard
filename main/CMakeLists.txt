@@ -11,6 +11,7 @@ idf_component_register(
         "network/wifi_manager.c"
         "network/mqtt_manager.c"
         "network/ota_manager.c"
+        "network/time_sync.c"
     INCLUDE_DIRS
         "."
         "app"

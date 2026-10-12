@@ -237,6 +237,8 @@ main/
     ota_manager.h
     shutdown_client.c
     shutdown_client.h
+    time_sync.c
+    time_sync.h
     wake_on_lan.c
     wake_on_lan.h
     wifi_manager.c
@@ -276,6 +278,7 @@ const ups_config_t g_ups_config = {
     .mqtt_password = "YOUR_MQTT_PASSWORD",
     .ota_port = 3232,
     .ota_bearer_token = "YOUR_OTA_TOKEN",
+    .ntp_server = "pool.ntp.org",
 };
 ```
 
@@ -296,6 +299,7 @@ Configuration fields:
 - `mqtt_password`: MQTT password (keep in gitignored `config.c`)
 - `ota_port`: LAN OTA HTTP server port, `0` uses the default `3232`
 - `ota_bearer_token`: token required on OTA requests, leave `NULL` only on a trusted network
+- `ntp_server`: NTP host used for the wall clock, `NULL` uses `pool.ntp.org`. Set this if the LAN has no internet or runs its own NTP server
 
 ## Build and Flash
 
@@ -409,9 +413,26 @@ Every application line is prefixed with a short tag. Use the tag to jump directl
 | `SHUTDOWN` | `main/network/shutdown_client.c` | Shutdown API and host health-check requests |
 | `WOL` | `main/network/wake_on_lan.c` | Wake-on-LAN packet transmission |
 | `OTA` | `main/network/ota_manager.c` | Firmware uploads, progress, rollback confirmation |
+| `TIMESYNC` | `main/network/time_sync.c` | NTP clock synchronisation |
 | `EVTLOG` | `main/app/event_log.c` | Persistent NVS event ring buffer |
 
 Remaining tags in the monitor output (`boot`, `esp_image`, `wifi`, `phy_init`, `esp-tls`, `transport_base`, `mqtt_client`, `heap_init`, `spi_flash`) come from ESP-IDF itself, not from this project.
+
+### Clock and timestamps
+
+The ESP32 has no RTC, so it boots with its clock near the epoch. SNTP is started in `app_main()` after Wi-Fi comes up and sets the clock to UTC:
+
+```text
+I (744) TIMESYNC: SNTP started, server=pool.ntp.org, clock is UTC
+I (33064) TIMESYNC: Clock synchronised, UTC now 2026-10-12T13:31:10Z
+```
+
+Notes:
+
+- The clock is **UTC**, and it re-syncs every 60 s (`CONFIG_LWIP_SNTP_UPDATE_DELAY`). The first request often fires before the DHCP lease exists and fails, so expect the first success within roughly 35 s of boot rather than immediately.
+- Set `ntp_server` in `config.c` if the LAN has no internet or runs its own NTP. Leaving it `NULL` uses `pool.ntp.org`.
+- `time_sync_is_valid()` is false until the first successful sync. **Anything that emits a timestamp must check it first** — a timestamp taken before sync is wrong, and publishing a wrong time is worse than publishing none.
+- The device's `uptime_s` in the event log is unrelated to this: it is seconds since boot and resets to 0. It is not a timestamp.
 
 ### Healthy Boot Sequence
 
