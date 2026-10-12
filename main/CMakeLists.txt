@@ -17,6 +17,4 @@ idf_component_register(
         "config"
         "drivers"
         "network"
-    EMBED_TXTFILES
-        "certs/poweroff_ca.pem"
 )

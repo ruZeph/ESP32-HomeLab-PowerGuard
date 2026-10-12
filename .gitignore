@@ -79,6 +79,3 @@ Desktop.ini
 
 # Config
 main/config/config.c
-
-# Generated TLS material: private keys must never be committed
-deploy/out/

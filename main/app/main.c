@@ -7,11 +7,9 @@
 #include "mqtt_manager.h"
 #include "event_log.h"
 #include "ota_manager.h"
-#include "shutdown_client.h"
 
 void app_main(void)
 {
-    shutdown_client_init();
     event_log_init();
     wifi_manager_init();
 
