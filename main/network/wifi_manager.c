@@ -48,7 +48,8 @@ static void wifi_event_handler(void *arg,
     }
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
     {
-        ESP_LOGI(TAG, "Wi-Fi connected");
+        const ip_event_got_ip_t *got_ip = (const ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "Wi-Fi connected, IP: " IPSTR, IP2STR(&got_ip->ip_info.ip));
         gpio_set_level(ONBOARD_LED, 1);
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }

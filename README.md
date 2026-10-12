@@ -21,6 +21,7 @@ When AC power disappears, the controller starts a shutdown countdown. If the out
 - Publishes live shutdown countdown over MQTT
 - Dumps full event log timeline to Home Assistant automatically on reconnect
 - Uses MQTT Last Will and Testament for ESP32 availability tracking
+- Accepts firmware updates pushed over the LAN, using a two-slot OTA layout with automatic rollback
 
 ## Current Host Flow
 
@@ -74,6 +75,7 @@ The controller connects to an MQTT broker and publishes state on every transitio
 | `powerguard/last_event` | Free text, e.g. `"shutdown cancelled"` | Retained |
 | `powerguard/event_log` | JSON array of last 30 events | Retained, automatically published on reconnect |
 | `powerguard/availability` | `"online"` / `"offline"` | LWT topic, retained. `"offline"` set by broker if ESP32 disconnects |
+| `powerguard/ota_status` | `"starting"`, `"updating 40%"`, `"complete, rebooting"`, `"failed: ..."` | Retained, published while a firmware update runs |
 
 The `availability` topic is the MQTT Last Will and Testament. Home Assistant uses it to distinguish "ESP32 itself is offline" from "mains power is lost" — these are different failure states.
 
@@ -101,6 +103,7 @@ On connect, retained discovery config payloads are published for these entities:
 | Force Wake-on-LAN | `button` | `mdi:power` |
 | Force Shutdown | `button` | `mdi:power-plug-off` |
 | Clear Event Log | `button` | `mdi:delete-sweep` |
+| OTA Status | `sensor` | `mdi:cloud-download-outline` |
 
 All entities are grouped under a single "PowerGuard" device in the HA UI, identified by the ESP32's MAC address.
 
@@ -213,6 +216,8 @@ main/
   network/
     mqtt_manager.c
     mqtt_manager.h
+    ota_manager.c
+    ota_manager.h
     shutdown_client.c
     shutdown_client.h
     wake_on_lan.c
@@ -220,6 +225,8 @@ main/
     wifi_manager.c
     wifi_manager.h
   idf_component.yml  # managed component dependency (espressif/mqtt)
+partitions.csv       # OTA partition layout
+sdkconfig.defaults   # partition table and rollback defaults
 ```
 
 ## Configuration
@@ -250,6 +257,8 @@ const ups_config_t g_ups_config = {
     .mqtt_port = 1883,
     .mqtt_username = "esp32",
     .mqtt_password = "YOUR_MQTT_PASSWORD",
+    .ota_port = 3232,
+    .ota_bearer_token = "YOUR_OTA_TOKEN",
 };
 ```
 
@@ -268,6 +277,8 @@ Configuration fields:
 - `mqtt_port`: MQTT broker port, typically `1883`
 - `mqtt_username`: MQTT username
 - `mqtt_password`: MQTT password (keep in gitignored `config.c`)
+- `ota_port`: LAN OTA HTTP server port, `0` uses the default `3232`
+- `ota_bearer_token`: token required on OTA requests, leave `NULL` only on a trusted network
 
 ## Build and Flash
 
@@ -285,6 +296,84 @@ If target is already set, a normal cycle is usually:
 idf.py build flash monitor
 ```
 
+Because OTA support changed the partition table, the first OTA-capable build must be written over USB. Every later update can be pushed over Wi-Fi.
+
+## Firmware Updates over LAN (OTA)
+
+The controller runs a small HTTP server so a new firmware image can be pushed to it over the LAN. A second application slot is used as a staging area, and the image is only selected for boot once the whole transfer has been written and validated.
+
+### Partition layout
+
+The OTA layout lives in [`partitions.csv`](./partitions.csv) and replaces the previous single-application table:
+
+| Partition | Offset | Size | Purpose |
+|---|---|---|---|
+| `nvs` | `0x9000` | 24K | Wi-Fi and event data |
+| `otadata` | `0xF000` | 8K | Which OTA slot to boot |
+| `phy_init` | `0x11000` | 4K | RF calibration |
+| `ota_0` | `0x20000` | 1856K | Running application |
+| `ota_1` | `0x1F0000` | 1856K | Staging slot for updates |
+
+There is no `factory` partition: the bootloader starts `ota_0` when `otadata` is empty. Because the partition table itself changed, the first OTA-capable image has to be written over USB:
+
+```sh
+idf.py -p COM3 flash monitor
+```
+
+### Pushing a build
+
+Build as usual, then POST the generated binary to the device:
+
+```sh
+idf.py build
+curl -v -X POST --data-binary "@build/UPS_Controller_ESP32.bin" http://<esp32-ip>:3232/ota
+```
+
+The device answers `Update complete. Rebooting.` and restarts into the new image after a brief delay. The address to use is printed in the boot log:
+
+```text
+WIFI: Wi-Fi connected, IP: 192.168.0.42
+```
+
+### Status endpoint
+
+```sh
+curl http://<esp32-ip>:3232/ota/status
+```
+
+```json
+{"project":"UPS_Controller_ESP32","version":"1a5dcdd","idf":"v6.1","running_partition":"ota_0","next_partition":"ota_1","update_in_progress":false,"port":3232}
+```
+
+`next_partition` is the slot the next upload will be written to, so it alternates between `ota_0` and `ota_1` after each update.
+
+### Authentication
+
+Set `ota_bearer_token` in `config.c` to require a token on both endpoints:
+
+```c
+.ota_bearer_token = "YOUR_OTA_TOKEN",
+```
+
+```sh
+curl -X POST -H "Authorization: Bearer YOUR_OTA_TOKEN" \
+     --data-binary "@build/UPS_Controller_ESP32.bin" http://<esp32-ip>:3232/ota
+```
+
+When `ota_bearer_token` is `NULL` or empty, uploads are accepted from anyone on the LAN and the firmware logs `OTA bearer token is not configured, uploads are unauthenticated` at boot. That is acceptable on a trusted network only.
+
+### Safety behaviour
+
+- **Rollback.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is enabled, so an updated image boots in `PENDING_VERIFY` state. `ota_manager_init()` confirms it with `esp_ota_mark_app_valid_cancel_rollback()` as soon as the application starts. An image that never gets that far is reverted by the bootloader on the next reset.
+- **Boot partition is set last.** `esp_ota_set_boot_partition()` only runs after the whole image is written and validated, so an interrupted transfer leaves the running image bootable.
+- **Power events block updates.** While a shutdown countdown or wake sequence is in progress the upload is rejected with `503 Service Unavailable`, because rebooting the controller would discard that state and the host would neither be shut down nor woken.
+- **One update at a time.** A second concurrent upload is rejected with `503 Service Unavailable`.
+- **Size check.** An image larger than the 1856K slot is rejected with `413` before anything is erased.
+
+### Update status over MQTT
+
+Progress is published to `powerguard/ota_status` as `starting`, `updating <n>%`, `complete, rebooting` or `failed: ...`, and is exposed in Home Assistant as the **OTA Status** sensor.
+
 ## Runtime Logs and Diagnostics
 
 Every application line is prefixed with a short tag. Use the tag to jump directly to the module that produced it.
@@ -298,6 +387,7 @@ Every application line is prefixed with a short tag. Use the tag to jump directl
 | `UPS` | `main/app/ups.c` | Power state machine, countdown, host wait states, Wake-on-LAN |
 | `SHUTDOWN` | `main/network/shutdown_client.c` | Shutdown API and host health-check requests |
 | `WOL` | `main/network/wake_on_lan.c` | Wake-on-LAN packet transmission |
+| `OTA` | `main/network/ota_manager.c` | Firmware uploads, progress, rollback confirmation |
 | `EVTLOG` | `main/app/event_log.c` | Persistent NVS event ring buffer |
 
 Remaining tags in the monitor output (`boot`, `esp_image`, `wifi`, `phy_init`, `esp-tls`, `transport_base`, `mqtt_client`, `heap_init`, `spi_flash`) come from ESP-IDF itself, not from this project.
@@ -402,6 +492,21 @@ Waiting-state messages such as `Shutdown in progress, waiting for host to go off
 | `WOL_RETRY` | Wake-on-LAN retry, `extra` is the retry number |
 | `WOL_FAILED` | Wake-on-LAN transmission failed |
 
+### OTA Logs
+
+| Log | Meaning |
+|---|---|
+| `OTA: Running image confirmed, rollback cancelled` | A freshly flashed image confirmed itself as valid |
+| `OTA: OTA server listening on port N, firmware X on partition 'ota_0'` | Upload server is up |
+| `OTA: OTA bearer token is not configured, uploads are unauthenticated` | No `ota_bearer_token` set, see the OTA section |
+| `OTA: Update started: N bytes into partition 'ota_1'` | Upload accepted, staging slot being erased and written |
+| `OTA: Update progress: N%` | Reported in 10% steps |
+| `OTA: Update complete, rebooting into partition 'ota_1'` | Image validated and selected, restart follows |
+| `OTA: Rejected update: controller is handling a power event` | Refused because a shutdown or wake sequence is in progress |
+| `OTA: Image too large: N bytes, partition 'ota_1' holds N` | Image exceeds the staging slot |
+| `OTA: Update interrupted after N of M bytes` | Client disconnected mid-transfer, staging slot abandoned |
+| `OTA: Image validation failed` | Uploaded data is not a valid application image |
+
 ### Expected Errors During Shutdown or Boot
 
 - `ESP_ERR_HTTP_CONNECT`
@@ -435,6 +540,17 @@ If Wi-Fi connects but MQTT stays down:
 - Expect `esp-tls: connect() error: Host is unreachable` and `MQTT: Disconnected from MQTT broker` during the first seconds after boot, before Wi-Fi associates.
 - If the errors continue after `WIFI: Wi-Fi connected`, verify that `mqtt_broker_url` and `mqtt_port` are reachable from the ESP32's subnet.
 
+If an OTA upload is rejected:
+
+- `401` means `ota_bearer_token` is set and the `Authorization: Bearer <token>` header is missing or wrong.
+- `503` means either an upload is already running or the controller is mid-shutdown/mid-wake. Retry once the UPS state is idle.
+- `413` means the image is bigger than the 1856K slot, which normally means the wrong file was passed.
+- `Content-Length required` means the body was sent without a length, for example as a chunked upload. Use `curl --data-binary` as shown in the OTA section.
+
+If an OTA update succeeds but the device comes back on the old firmware:
+
+- The new image did not confirm itself, so `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` reverted it. Check the boot log for a crash before `OTA: Running image confirmed, rollback cancelled`.
+
 If shutdown works but wake does not:
 
 - Verify BIOS/UEFI Wake-on-LAN settings
@@ -462,6 +578,7 @@ If recovery feels slow:
 - This project currently uses a small native ESP-IDF Wake-on-LAN implementation in `main/network/wake_on_lan.c`.
 - The previously considered Arduino-oriented `a7md0/WakeOnLan` library was not integrated because this project is plain ESP-IDF, not Arduino.
 - Sensitive values should stay only in the ignored local config file.
+- `ota_port` and `ota_bearer_token` are optional. An existing `config.c` that does not set them still compiles and falls back to port `3232` with upload authentication disabled.
 - MQTT uses the `espressif/mqtt` managed component, declared in `main/idf_component.yml`.
 
 If MQTT entities don't appear in Home Assistant:

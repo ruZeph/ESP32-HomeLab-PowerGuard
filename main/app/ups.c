@@ -489,6 +489,17 @@ void ups_publish_current_state(void)
     // Note: if CONTROLLER_COUNTDOWN, the live loop will publish countdown on next tick
 }
 
+bool ups_is_reboot_safe(void)
+{
+    bool safe;
+
+    portENTER_CRITICAL(&s_ups_lock);
+    safe = (ups.controllerState == CONTROLLER_IDLE);
+    portEXIT_CRITICAL(&s_ups_lock);
+
+    return safe;
+}
+
 void ups_init(void)
 {
     power_sensor_init();

@@ -20,6 +20,9 @@ typedef struct
     uint32_t    mqtt_port;            // Example: 1883
     const char *mqtt_username;        // Example: esp32
     const char *mqtt_password;        // Broker password (keep in gitignored config.c)
+
+    uint32_t    ota_port;             // LAN OTA HTTP port, 0 uses the default 3232
+    const char *ota_bearer_token;     // Token required on OTA requests, NULL to allow without auth
 } ups_config_t;
 
 extern const ups_config_t g_ups_config;

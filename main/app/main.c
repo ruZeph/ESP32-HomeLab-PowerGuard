@@ -6,9 +6,11 @@
 #include "wifi_manager.h"
 #include "mqtt_manager.h"
 #include "event_log.h"
+#include "ota_manager.h"
 
 void app_main(void)
 {
+    ota_manager_init();
     event_log_init();
     wifi_manager_init();
     mqtt_manager_init();

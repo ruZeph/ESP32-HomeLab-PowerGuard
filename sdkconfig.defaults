@@ -1,0 +1,11 @@
+# Applied when sdkconfig is generated from scratch. An existing sdkconfig is
+# not modified by this file.
+
+# LAN OTA: two application slots plus otadata, defined in partitions.csv.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Boot a freshly updated image in PENDING_VERIFY state and fall back to the
+# previous image unless the new one confirms itself via
+# esp_ota_mark_app_valid_cancel_rollback().
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

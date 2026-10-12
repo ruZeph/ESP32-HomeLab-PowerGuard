@@ -22,6 +22,7 @@
 #define TOPIC_EVENT_LOG      "powerguard/event_log"
 #define TOPIC_TOTAL_POWERCUTS "powerguard/total_powercuts"
 #define TOPIC_AVAILABILITY   "powerguard/availability"
+#define TOPIC_OTA_STATUS     "powerguard/ota_status"
 
 #define TOPIC_CMD_CANCEL     "powerguard/command/cancel_shutdown"
 #define TOPIC_CMD_FORCE_WOL  "powerguard/command/force_wol"
@@ -222,6 +223,10 @@ static void publish_ha_discovery(void)
         "total_powercuts", "Total Powercuts",
         TOPIC_TOTAL_POWERCUTS, "mdi:flash-off");
 
+    publish_ha_discovery_sensor(
+        "ota_status", "OTA Status",
+        TOPIC_OTA_STATUS, "mdi:cloud-download-outline");
+
     publish_ha_discovery_button(
         "cancel_shutdown", "Cancel Shutdown",
         TOPIC_CMD_CANCEL, "mdi:cancel");
@@ -406,4 +411,9 @@ void mqtt_publish_powercut_count(void)
     char payload[16];
     snprintf(payload, sizeof(payload), "%lu", (unsigned long)event_log_get_powercut_count());
     publish(TOPIC_TOTAL_POWERCUTS, payload, 1, 1);
+}
+
+void mqtt_publish_ota_status(const char *state)
+{
+    publish(TOPIC_OTA_STATUS, state, 1, 1);
 }
