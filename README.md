@@ -285,31 +285,130 @@ If target is already set, a normal cycle is usually:
 idf.py build flash monitor
 ```
 
-## Runtime Logs
+## Runtime Logs and Diagnostics
 
-Typical useful logs:
+Every application line is prefixed with a short tag. Use the tag to jump directly to the module that produced it.
 
-- `UPS: Power LOST`
-- `UPS: Shutdown countdown started (30 s)`
-- `UPS: Shutdown cancelled`
-- `SHUTDOWN: Shutdown request accepted, HTTP status = 202`
-- `UPS: Host shutdown confirmed`
-- `UPS: Host is off, waiting for power restoration before Wake-on-LAN`
-- `WOL: WOL packet sent to ...`
-- `UPS: Host is back online`
-- `MQTT: Connected to MQTT broker`
-- `MQTT: HA discovery payloads published`
-- `MQTT: Received cancel_shutdown command via MQTT`
-- `MQTT: Received force_wol command via MQTT`
-- `MQTT: Disconnected from MQTT broker`
+### Log Tag Reference
 
-Expected temporary errors during shutdown or boot:
+| Tag | Source file | Covers |
+|---|---|---|
+| `WIFI` | `main/network/wifi_manager.c` | Wi-Fi start, connect, disconnect reasons |
+| `MQTT` | `main/network/mqtt_manager.c` | Broker connection, HA discovery, commands, publishes |
+| `UPS` | `main/app/ups.c` | Power state machine, countdown, host wait states, Wake-on-LAN |
+| `SHUTDOWN` | `main/network/shutdown_client.c` | Shutdown API and host health-check requests |
+| `WOL` | `main/network/wake_on_lan.c` | Wake-on-LAN packet transmission |
+| `EVTLOG` | `main/app/event_log.c` | Persistent NVS event ring buffer |
+
+Remaining tags in the monitor output (`boot`, `esp_image`, `wifi`, `phy_init`, `esp-tls`, `transport_base`, `mqtt_client`, `heap_init`, `spi_flash`) come from ESP-IDF itself, not from this project.
+
+### Healthy Boot Sequence
+
+```text
+I (443) boot: Loaded app from partition at offset 0x10000
+I (467) app_init: Project name:     UPS_Controller_ESP32
+I (536) spi_flash: detected chip: ...
+I (543) main_task: Calling app_main()
+I (573) EVTLOG: Loaded 30 events from NVS
+I (773) wifi:mode : sta (xx:xx:xx:xx:xx:xx)
+I (773) WIFI: Wi-Fi starting...
+I (803) EVTLOG: [t=0] ESP_BOOTED (extra=0)
+I (803) UPS: UPS controller initialized
+I (823) MQTT: MQTT client starting, broker=mqtt://<broker>:1883
+I (xxxx) WIFI: Wi-Fi connected
+I (xxxx) MQTT: Connected to MQTT broker
+I (xxxx) MQTT: Subscribed, msg_id=...
+I (xxxx) MQTT: HA discovery payloads published
+```
+
+`app_main()` starts Wi-Fi and MQTT back to back, so the MQTT client is created before Wi-Fi has an IP address. The first broker attempts therefore fail with `esp-tls: connect() error: Host is unreachable` and `MQTT: Disconnected from MQTT broker` until association completes. This is expected with the current startup order and resolves itself once Wi-Fi connects.
+
+### Wi-Fi Disconnect Reasons
+
+`WIFI: Wi-Fi disconnected, reason=<n>, retrying...` is logged by `wifi_manager.c` on `WIFI_EVENT_STA_DISCONNECTED`. The `reason` value is an ESP-IDF `wifi_err_reason_t`.
+
+| Reason | Name | Meaning | Typical cause |
+|---|---|---|---|
+| `200` | `BEACON_TIMEOUT` | AP stopped responding | AP reboot, out of range, interference |
+| `201` | `NO_AP_FOUND` | No AP with the configured SSID was found | **SSID typo, wrong case, hidden SSID, 5 GHz-only AP, or AP on channel 12–13** |
+| `202` | `AUTH_FAIL` | Authentication rejected | Wrong Wi-Fi password |
+| `203` | `ASSOC_FAIL` | Association rejected | AP security/mode mismatch |
+| `204` | `HANDSHAKE_TIMEOUT` | 4-way handshake failed | Wrong password, PMF mismatch |
+| `205` | `CONNECTION_FAIL` | Generic connect failure | AP overloaded or driver state issue |
+| `210` | `NO_AP_FOUND_W_COMPATIBLE_SECURITY` | SSID seen, no compatible security | WPA3-only AP with default authmode threshold |
+| `211` | `NO_AP_FOUND_IN_AUTHMODE_THRESHOLD` | SSID seen but filtered out | `threshold.authmode` set too strict |
+| `212` | `NO_AP_FOUND_IN_RSSI_THRESHOLD` | SSID seen but signal too weak | `threshold.rssi` set too strict, weak signal |
+
+Reading the reason code:
+
+- `201` is a **scan** failure, not a credential failure. Changing `wifi_password` can never fix it. Only the SSID string, band, channel and country settings matter.
+- `202` and `204` are credential failures — check `wifi_password`.
+- `210`, `211` and `212` mean the AP *was* seen but was filtered out by the security or RSSI threshold.
+
+`reason=201` checklist:
+
+1. Compare `wifi_ssid` in `config.c` character-by-character against the SSID the router actually broadcasts. Case and trailing spaces matter (`OpenWrt` and `openwrt` are different networks).
+2. Confirm the AP broadcasts on 2.4 GHz. The ESP32 has no 5 GHz radio.
+3. Confirm the AP is not on channel 12 or 13. With the default country code the ESP32 scans channels 1–11 only. Set the AP to a channel in 1–11, or configure a matching country code in the firmware.
+4. Run a Wi-Fi scan on a phone or laptop next to the ESP32 to confirm the SSID is visible at that location and to see which channel it uses.
+
+### MQTT Logs
+
+| Log | Meaning |
+|---|---|
+| `MQTT: MQTT client starting, broker=...` | Client created and started |
+| `MQTT: Connected to MQTT broker` | Session established; discovery and subscriptions follow |
+| `MQTT: Subscribed, msg_id=...` | A command topic subscription was acknowledged |
+| `MQTT: HA discovery payloads published` | Home Assistant discovery config was sent |
+| `MQTT: Disconnected from MQTT broker` | Session lost, for example because the broker or network is down |
+| `MQTT: MQTT error event` | Broker socket/TLS error, details logged by `esp-tls`/`transport_base` |
+| `MQTT: Event log published (N bytes)` | Log payload handed to the client |
+
+`MQTT: Event log published` reports the payload size handed to the MQTT client, not broker confirmation. QoS 1 publishes issued while disconnected are queued in the client outbox and sent after reconnect, so the line can appear before the session is up.
+
+### UPS State Logs
+
+| Log | Meaning |
+|---|---|
+| `UPS: UPS controller initialized` | `ups_init()` completed |
+| `UPS: Power RESTORED` / `UPS: Power LOST` | Mains transition detected on `GPIO34` |
+| `UPS: Shutdown countdown started (N s)` | Countdown armed after power loss |
+| `UPS: Shutdown cancelled` | Power returned before the countdown expired |
+| `UPS: Shutdown Triggered` | Countdown expired, shutdown API called |
+| `UPS: Shutdown request failed` | Shutdown API call failed; state is confirmed by polling the host |
+| `UPS: Host shutdown confirmed` | Health endpoint stopped responding |
+| `UPS: Host is off, waiting for power restoration before Wake-on-LAN` | Shutdown done, waiting for mains |
+| `UPS: Host is back online` | Health endpoint recovered after Wake-on-LAN |
+| `UPS: Startup recovery check: ...` | Boot-time host reconciliation after a reset |
+| `UPS: Startup recovery pending, waiting for Wi-Fi before host check` | Recovery deferred until Wi-Fi returns |
+
+Waiting-state messages such as `Shutdown in progress, waiting for host to go offline` and `Wake sent, waiting for host health check to come back online` are throttled and repeat only while the state is unchanged.
+
+### Event Log Messages
+
+`EVTLOG: [t=<uptime seconds>] <EVENT> (extra=<n>)` prints each recorded event. `extra` carries context such as the Wake-on-LAN retry number, or `0` when unused.
+
+| Event | Meaning |
+|---|---|
+| `ESP_BOOTED` | Controller started |
+| `POWER_LOST` | Mains power lost |
+| `POWER_RESTORED` | Mains power returned |
+| `SHUTDOWN_TRIGGERED` | Shutdown API called |
+| `SHUTDOWN_FAILED` | Shutdown API call failed |
+| `SHUTDOWN_CANCELLED` | Countdown cancelled by power restoration |
+| `HOST_DOWN_CONFIRMED` | Host confirmed offline |
+| `HOST_BACK_ONLINE` | Host confirmed online again |
+| `WOL_SENT` | Wake-on-LAN packet sent |
+| `WOL_RETRY` | Wake-on-LAN retry, `extra` is the retry number |
+| `WOL_FAILED` | Wake-on-LAN transmission failed |
+
+### Expected Errors During Shutdown or Boot
 
 - `ESP_ERR_HTTP_CONNECT`
 - `Connection reset by peer`
 - `select() timeout`
 
-Those usually mean the host is shutting down or the health service is not up yet. The controller now treats those as expected during transition states.
+Those usually mean the host is shutting down or the health service is not up yet. The controller treats those as expected during transition states.
 
 ## Host Requirements
 
@@ -323,6 +422,18 @@ For reliable operation, the server should have:
 - An MQTT broker reachable on the LAN (e.g. Mosquitto on the Home Assistant host)
 
 ## Troubleshooting
+
+If the controller never connects to Wi-Fi:
+
+- Look for `WIFI: Wi-Fi disconnected, reason=<n>, retrying...` in the monitor output and read `<n>` with the reason table above.
+- `reason=201` (`NO_AP_FOUND`) means the SSID was never found during the scan. Re-check `wifi_ssid` in `config.c` against the exact SSID the router broadcasts, confirm the AP has 2.4 GHz enabled, and confirm the AP is not on channel 12 or 13.
+- `reason=202` or `reason=204` means the SSID was found but the credential exchange failed. Re-check `wifi_password`.
+- The retry loop repeats forever with no backoff, so a steady stream of the same reason code means the configured network genuinely cannot be reached.
+
+If Wi-Fi connects but MQTT stays down:
+
+- Expect `esp-tls: connect() error: Host is unreachable` and `MQTT: Disconnected from MQTT broker` during the first seconds after boot, before Wi-Fi associates.
+- If the errors continue after `WIFI: Wi-Fi connected`, verify that `mqtt_broker_url` and `mqtt_port` are reachable from the ESP32's subnet.
 
 If shutdown works but wake does not:
 
