@@ -9,3 +9,10 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # previous image unless the new one confirms itself via
 # esp_ota_mark_app_valid_cancel_rollback().
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Build for size: the application lives in a 1856K OTA slot, so a smaller image
+# keeps headroom for future features and shortens LAN update transfers.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# The controller is station-only and never brings up a SoftAP interface.
+# CONFIG_ESP_WIFI_SOFTAP_SUPPORT is not set

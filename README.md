@@ -298,6 +298,8 @@ idf.py build flash monitor
 
 Because OTA support changed the partition table, the first OTA-capable build must be written over USB. Every later update can be pushed over Wi-Fi.
 
+The application is compiled with `CONFIG_COMPILER_OPTIMIZATION_SIZE` (`-Os`) and has to fit the 1856K `ota_0`/`ota_1` slots. A full build is currently about 836 KB of that.
+
 ## Firmware Updates over LAN (OTA)
 
 The controller runs a small HTTP server so a new firmware image can be pushed to it over the LAN. A second application slot is used as a staging area, and the image is only selected for boot once the whole transfer has been written and validated.
