@@ -64,6 +64,9 @@ Important behavior detail:
 - A health check only counts as "host is up" when it returns HTTP `2xx`. A `4xx`/`5xx` response is treated as the host not being healthy, so a broken health endpoint cannot keep the controller waiting indefinitely.
 - Shutdown requests are retried every `15 s` for up to 20 attempts. After that the controller backs off to one attempt every 5 minutes and records a `SHUTDOWN_FAILED` event, because the host is still running with power out and continuing to try matters more than giving up.
 - A shutdown request that is **sent but never answered** is not a failure. A host that stops services before replying looks exactly like a timeout, so that case is logged as `Shutdown request sent, no response yet` and the host state decides the outcome. Only a request that could not be delivered, or that was explicitly rejected, records `SHUTDOWN_FAILED` with `extra=0`.
+- A **manual** shutdown (`powerguard/command/force_shutdown`) only wakes the host again if mains is out at the time, or goes out before the shutdown completes. With mains present the host is left off and `host_state` is published as `down`. Wake-on-LAN is decided from why the episode started, not from the current sensor reading.
+- While idle with the host believed down, the controller probes the health endpoint once a minute purely to report when it comes back. That probe **never** sends Wake-on-LAN, so an intentionally powered-off host stays off.
+- A manual shutdown is **not** preserved across an ESP32 reboot: boot-time recovery still sends Wake-on-LAN when the host is offline and mains is present, because that is how unattended outage recovery works after a controller restart.
 
 ### Timing characteristics
 
@@ -519,13 +522,14 @@ Reading the reason code:
 | `UPS: Shutdown request was not delivered` | The request could not be sent, or the host rejected it. State is still confirmed by polling the host |
 | `UPS: Shutdown request sent, no response yet; letting the host state decide` | Written and possibly accepted, but the reply timed out. Not treated as a failure |
 | `UPS: Power is back, waiting for the host to finish shutting down` | Mains returned mid-shutdown; the episode stays open until the host goes down |
+| `UPS: Manual shutdown complete with mains present, leaving host off` | Manual shutdown finished with mains present, so no wake is sent |
 | `UPS: Host still reachable N s after the shutdown request, giving up` | Confirm window expired, the shutdown had no effect |
 | `UPS: Host still reachable, retrying shutdown command (N)` | Shutdown retry, `15 s` cadence |
 | `UPS: Host still reachable after 20 shutdown attempts, backing off to every 300 s` | Retry cap reached, switching to the slow cadence |
 | `SHUTDOWN: Health check returned HTTP status = N, treating host as not healthy` | Health endpoint answered but was not `2xx` |
 | `UPS: Host shutdown confirmed` | Health endpoint stopped responding or stopped returning `2xx` |
 | `UPS: Host is off, waiting for power restoration before Wake-on-LAN` | Shutdown done, waiting for mains |
-| `UPS: Host is back online` | Health endpoint recovered after Wake-on-LAN |
+| `UPS: Host is back online` | Health endpoint recovered after Wake-on-LAN, or was seen online again by the idle probe |
 | `UPS: Startup recovery check: ...` | Boot-time host reconciliation after a reset |
 | `UPS: Startup recovery pending, waiting for Wi-Fi before host check` | Recovery deferred until Wi-Fi returns |
 

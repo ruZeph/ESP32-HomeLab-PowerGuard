@@ -42,6 +42,13 @@ typedef struct
     TickType_t nextShutdownRetryTick;
     TickType_t shutdownConfirmDeadlineTick;
     bool startupRecoveryPending;
+    /* True when this episode began with, or saw, a mains loss. A manual
+       shutdown with mains present must not wake the host afterwards. */
+    bool episodeNeedsWake;
+    /* Last observed host health, used so the idle state can report host_state
+       honestly instead of assuming the host is up. */
+    bool hostKnownDown;
+    TickType_t nextIdleHostCheckTick;
 } ups_controller_t;
 
 static ups_controller_t ups = {
@@ -86,6 +93,10 @@ static const uint32_t SHUTDOWN_RETRY_BACKOFF_MS = 300000;
    power may return during that window. */
 static const uint32_t SHUTDOWN_CONFIRM_TIMEOUT_MS = 300000;
 
+/* Idle health probe cadence, used only while the host is believed to be down.
+   This never sends Wake-on-LAN; it only keeps host_state accurate. */
+static const uint32_t IDLE_HOST_CHECK_INTERVAL_MS = 60000;
+
 /* Remaining seconds most recently published, so the countdown is only sent
    when the value changes. UINT32_MAX means nothing has been published yet. */
 static uint32_t s_last_published_countdown = UINT32_MAX;
@@ -114,6 +125,9 @@ static void shutdown_timer_cb(TimerHandle_t timer)
         ups.shutdownRetriesSent = 0;
         ups.nextShutdownRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
         ups.shutdownConfirmDeadlineTick = xTaskGetTickCount() + pdMS_TO_TICKS(SHUTDOWN_CONFIRM_TIMEOUT_MS);
+        /* This path exists only because mains was lost, so the host should be
+           woken once the power situation allows it. */
+        ups.episodeNeedsWake = true;
 
         shutdown_result_t result = shutdown_client_send();
         if (result == SHUTDOWN_REQUEST_FAILED)
@@ -237,6 +251,10 @@ void ups_force_shutdown(void)
         ups.shutdownRetriesSent = 0;
         ups.nextShutdownRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
         ups.shutdownConfirmDeadlineTick = xTaskGetTickCount() + pdMS_TO_TICKS(SHUTDOWN_CONFIRM_TIMEOUT_MS);
+        /* A manual shutdown only implies a later wake if mains is already out,
+           because then this is really an outage being handled early. With mains
+           present the host must stay off. */
+        ups.episodeNeedsWake = (ups.powerState == POWER_LOST);
 
         if (shutdown_client_send() == SHUTDOWN_REQUEST_FAILED)
         {
@@ -292,6 +310,10 @@ static void schedule_next_host_check(uint32_t delay_ms)
 
 static void on_power_lost(void)
 {
+    /* Any mains loss during an episode means the host must be woken once power
+       is back, even if the episode started as a manual shutdown. */
+    ups.episodeNeedsWake = true;
+
     leds_set_power_state(POWER_LOST);
     start_countdown();
 }
@@ -360,6 +382,8 @@ static void process_host_state(void)
 
         if (reachability == HOST_REACHABLE)
         {
+            ups.hostKnownDown = false;
+
             if (power_sensor_read() == POWER_PRESENT)
             {
                 /* The shutdown request has already been sent, so "host still
@@ -369,7 +393,9 @@ static void process_host_state(void)
                    host finished going down just after mains returned. */
                 if (xTaskGetTickCount() < ups.shutdownConfirmDeadlineTick)
                 {
-                    log_host_wait_state("Power is back, waiting for the host to finish shutting down");
+                    log_host_wait_state(ups.episodeNeedsWake
+                                            ? "Power is back, waiting for the host to finish shutting down"
+                                            : "Shutdown in progress, waiting for the host to go offline");
                     return;
                 }
 
@@ -422,14 +448,27 @@ static void process_host_state(void)
 
         ESP_LOGI(TAG, "Host shutdown confirmed");
         s_last_host_wait_log = NULL;
+        ups.hostKnownDown = true;
         mqtt_publish_host_state("down");
         mqtt_publish_last_event("host shutdown confirmed");
         event_log_record(EVT_HOST_DOWN_CONFIRMED, 0);
 
         if (power_sensor_read() == POWER_PRESENT)
         {
-            ESP_LOGI(TAG, "Power is back, sending Wake-on-LAN");
-            send_wake_signal();
+            if (ups.episodeNeedsWake)
+            {
+                ESP_LOGI(TAG, "Power is back, sending Wake-on-LAN");
+                send_wake_signal();
+                return;
+            }
+
+            /* Manual shutdown with mains present: the host must stay off. */
+            ESP_LOGI(TAG, "Manual shutdown complete with mains present, leaving host off");
+            portENTER_CRITICAL(&s_ups_lock);
+            ups.controllerState = CONTROLLER_IDLE;
+            portEXIT_CRITICAL(&s_ups_lock);
+            mqtt_publish_last_event("host shut down manually");
+            ups.nextIdleHostCheckTick = xTaskGetTickCount() + pdMS_TO_TICKS(IDLE_HOST_CHECK_INTERVAL_MS);
             return;
         }
 
@@ -475,6 +514,7 @@ static void process_host_state(void)
         ups.controllerState = CONTROLLER_IDLE;
         portEXIT_CRITICAL(&s_ups_lock);
         s_last_host_wait_log = NULL;
+        ups.hostKnownDown = false;
         ESP_LOGI(TAG, "Host is back online");
         mqtt_publish_host_state("up");
         mqtt_publish_countdown("idle");
@@ -502,6 +542,7 @@ static void process_startup_recovery(void)
     {
         ups.startupRecoveryPending = false;
         s_last_host_wait_log = NULL;
+        ups.hostKnownDown = false;
         ESP_LOGI(TAG, "Startup recovery check: host is already online");
         ups_publish_current_state();
         return;
@@ -509,9 +550,44 @@ static void process_startup_recovery(void)
 
     ups.startupRecoveryPending = false;
     s_last_host_wait_log = NULL;
+    ups.hostKnownDown = true;
     ESP_LOGI(TAG, "Startup recovery check: host is offline while power is present, sending Wake-on-LAN");
     send_wake_signal();
     ups_publish_current_state();
+}
+
+/**
+ * Keeps host_state accurate while idle after a host was seen to go down, for
+ * example following a manual shutdown. This only probes health; it never sends
+ * Wake-on-LAN, so an intentionally powered-off host stays off.
+ */
+static void process_idle_host_check(void)
+{
+    if (ups.controllerState != CONTROLLER_IDLE || ups.startupRecoveryPending)
+    {
+        return;
+    }
+
+    if (!ups.hostKnownDown || !wifi_manager_is_connected())
+    {
+        return;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    if (now < ups.nextIdleHostCheckTick)
+    {
+        return;
+    }
+    ups.nextIdleHostCheckTick = now + pdMS_TO_TICKS(IDLE_HOST_CHECK_INTERVAL_MS);
+
+    if (shutdown_client_check_host_reachability() == HOST_REACHABLE)
+    {
+        ups.hostKnownDown = false;
+        ESP_LOGI(TAG, "Host is back online");
+        mqtt_publish_host_state("up");
+        mqtt_publish_last_event("host back online");
+        event_log_record(EVT_HOST_BACK_ONLINE, 0);
+    }
 }
 
 void ups_publish_current_state(void)
@@ -531,7 +607,7 @@ void ups_publish_current_state(void)
 
     if (ctrl == CONTROLLER_IDLE && !ups.startupRecoveryPending)
     {
-        mqtt_publish_host_state("up");
+        mqtt_publish_host_state(ups.hostKnownDown ? "down" : "up");
         mqtt_publish_countdown("idle");
     }
     else if (ctrl == CONTROLLER_HOST_DOWN_WAITING_FOR_POWER || ctrl == CONTROLLER_WAITING_FOR_HOST_UP)
@@ -568,6 +644,10 @@ void ups_init(void)
     ups.nextHostCheckTick = 0;
     ups.countdownStartTick = 0;
     ups.startupRecoveryPending = true;
+    ups.shutdownConfirmDeadlineTick = 0;
+    ups.episodeNeedsWake = false;
+    ups.hostKnownDown = false;
+    ups.nextIdleHostCheckTick = 0;
 
     ups.shutdownTimer = xTimerCreate(
         "ups_shutdown",
@@ -622,4 +702,5 @@ void ups_update(void)
 
     process_startup_recovery();
     process_host_state();
+    process_idle_host_check();
 }
