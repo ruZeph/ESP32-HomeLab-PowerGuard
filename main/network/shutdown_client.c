@@ -19,6 +19,17 @@ static bool is_expected_disconnect(esp_err_t err)
     return err == ESP_ERR_HTTP_CONNECT || err == ESP_ERR_HTTP_FETCH_HEADER;
 }
 
+/* The request was written but no usable response came back. A host that stops
+   services before replying produces exactly this, so it must not be reported
+   as a failure: the shutdown may well have been accepted. */
+static bool is_delivery_unconfirmed(esp_err_t err)
+{
+    return err == ESP_ERR_HTTP_FETCH_HEADER ||
+           err == ESP_ERR_HTTP_READ_TIMEOUT ||
+           err == ESP_ERR_HTTP_CONNECTION_CLOSED ||
+           err == ESP_ERR_HTTP_INCOMPLETE_DATA;
+}
+
 static void apply_auth_header(esp_http_client_handle_t client)
 {
     char auth_header[256];
@@ -29,18 +40,18 @@ static void apply_auth_header(esp_http_client_handle_t client)
     esp_http_client_set_header(client, "Authorization", auth_header);
 }
 
-esp_err_t shutdown_client_send(void)
+shutdown_result_t shutdown_client_send(void)
 {
     if (!has_text(g_ups_config.shutdown_url))
     {
         ESP_LOGE(TAG, "Shutdown URL is not configured");
-        return ESP_ERR_INVALID_ARG;
+        return SHUTDOWN_REQUEST_FAILED;
     }
 
     if (!has_text(g_ups_config.shutdown_bearer_token))
     {
         ESP_LOGE(TAG, "Shutdown bearer token is not configured");
-        return ESP_ERR_INVALID_ARG;
+        return SHUTDOWN_REQUEST_FAILED;
     }
 
     esp_http_client_config_t cfg = {
@@ -52,11 +63,13 @@ esp_err_t shutdown_client_send(void)
     if (!client)
     {
         ESP_LOGE(TAG, "Failed to create HTTP client");
-        return ESP_FAIL;
+        return SHUTDOWN_REQUEST_FAILED;
     }
 
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     apply_auth_header(client);
+
+    shutdown_result_t result = SHUTDOWN_REQUEST_FAILED;
 
     esp_err_t err = esp_http_client_perform(client);
     if (err == ESP_OK)
@@ -65,12 +78,18 @@ esp_err_t shutdown_client_send(void)
         if (status >= 200 && status < 300)
         {
             ESP_LOGI(TAG, "Shutdown request accepted, HTTP status = %d", status);
+            result = SHUTDOWN_REQUEST_ACCEPTED;
         }
         else
         {
             ESP_LOGE(TAG, "Shutdown request rejected, HTTP status = %d", status);
-            err = ESP_FAIL;
         }
+    }
+    else if (is_delivery_unconfirmed(err))
+    {
+        ESP_LOGW(TAG, "Shutdown request sent, no response (%s); the host may still act on it",
+                 esp_err_to_name(err));
+        result = SHUTDOWN_REQUEST_UNCONFIRMED;
     }
     else
     {
@@ -78,7 +97,7 @@ esp_err_t shutdown_client_send(void)
     }
 
     esp_http_client_cleanup(client);
-    return err;
+    return result;
 }
 
 host_reachability_t shutdown_client_check_host_reachability(void)

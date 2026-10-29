@@ -40,6 +40,7 @@ typedef struct
     uint32_t wolRetriesSent;
     uint32_t shutdownRetriesSent;
     TickType_t nextShutdownRetryTick;
+    TickType_t shutdownConfirmDeadlineTick;
     bool startupRecoveryPending;
 } ups_controller_t;
 
@@ -80,6 +81,11 @@ static const uint32_t MAX_WOL_RETRIES = 20;
 static const uint32_t MAX_SHUTDOWN_RETRIES = 20;
 static const uint32_t SHUTDOWN_RETRY_BACKOFF_MS = 300000;
 
+/* How long to keep watching the host for shutdown confirmation after the
+   request has been sent. A host stopping many services can take a while, and
+   power may return during that window. */
+static const uint32_t SHUTDOWN_CONFIRM_TIMEOUT_MS = 300000;
+
 /* Remaining seconds most recently published, so the countdown is only sent
    when the value changes. UINT32_MAX means nothing has been published yet. */
 static uint32_t s_last_published_countdown = UINT32_MAX;
@@ -107,14 +113,20 @@ static void shutdown_timer_cb(TimerHandle_t timer)
 
         ups.shutdownRetriesSent = 0;
         ups.nextShutdownRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
+        ups.shutdownConfirmDeadlineTick = xTaskGetTickCount() + pdMS_TO_TICKS(SHUTDOWN_CONFIRM_TIMEOUT_MS);
 
-        if (shutdown_client_send() != ESP_OK)
+        shutdown_result_t result = shutdown_client_send();
+        if (result == SHUTDOWN_REQUEST_FAILED)
         {
-            ESP_LOGE(TAG, "Shutdown request failed");
+            ESP_LOGE(TAG, "Shutdown request was not delivered");
             event_log_record(EVT_SHUTDOWN_FAILED, 0);
             /* Do not revert to IDLE here! The host might still be shutting down 
                since it drops the HTTP connection instantly. Let process_host_state 
                confirm whether the host goes down or stays up. */
+        }
+        else if (result == SHUTDOWN_REQUEST_UNCONFIRMED)
+        {
+            ESP_LOGW(TAG, "Shutdown request sent, no response yet; letting the host state decide");
         }
     }
 }
@@ -224,10 +236,11 @@ void ups_force_shutdown(void)
 
         ups.shutdownRetriesSent = 0;
         ups.nextShutdownRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
+        ups.shutdownConfirmDeadlineTick = xTaskGetTickCount() + pdMS_TO_TICKS(SHUTDOWN_CONFIRM_TIMEOUT_MS);
 
-        if (shutdown_client_send() != ESP_OK)
+        if (shutdown_client_send() == SHUTDOWN_REQUEST_FAILED)
         {
-            ESP_LOGE(TAG, "Manual Shutdown request failed");
+            ESP_LOGE(TAG, "Manual Shutdown request was not delivered");
             event_log_record(EVT_SHUTDOWN_FAILED, 1);
             /* Do not revert to IDLE here, let process_host_state handle it */
         }
@@ -349,10 +362,25 @@ static void process_host_state(void)
         {
             if (power_sensor_read() == POWER_PRESENT)
             {
-                ESP_LOGI(TAG, "Power is back and host never went offline. Aborting shutdown wait.");
+                /* The shutdown request has already been sent, so "host still
+                   reachable" does not mean the shutdown did not happen: a host
+                   stopping many services keeps answering for tens of seconds.
+                   Dropping the episode here used to lose the wake path when the
+                   host finished going down just after mains returned. */
+                if (xTaskGetTickCount() < ups.shutdownConfirmDeadlineTick)
+                {
+                    log_host_wait_state("Power is back, waiting for the host to finish shutting down");
+                    return;
+                }
+
+                ESP_LOGE(TAG, "Host still reachable %lu s after the shutdown request, giving up",
+                         (unsigned long)(SHUTDOWN_CONFIRM_TIMEOUT_MS / 1000));
                 portENTER_CRITICAL(&s_ups_lock);
                 ups.controllerState = CONTROLLER_IDLE;
                 portEXIT_CRITICAL(&s_ups_lock);
+                s_last_host_wait_log = NULL;
+                mqtt_publish_last_event("shutdown did not take effect");
+                event_log_record(EVT_SHUTDOWN_FAILED, 3);
                 return;
             }
 
@@ -381,9 +409,9 @@ static void process_host_state(void)
                     ESP_LOGW(TAG, "Host still reachable, retrying shutdown command (%lu)", (unsigned long)ups.shutdownRetriesSent);
                 }
 
-                if (shutdown_client_send() != ESP_OK)
+                if (shutdown_client_send() == SHUTDOWN_REQUEST_FAILED)
                 {
-                    ESP_LOGE(TAG, "Shutdown retry failed");
+                    ESP_LOGE(TAG, "Shutdown retry was not delivered");
                 }
                 ups.nextShutdownRetryTick = now + pdMS_TO_TICKS(retry_interval_ms);
             }

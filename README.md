@@ -59,9 +59,11 @@ Normal sequence:
 
 Important behavior detail:
 
-- If power returns while the host is still shutting down, the ESP32 waits for shutdown confirmation before sending Wake-on-LAN. This avoids racing the host during power restoration.
+- If power returns while the host is still shutting down, the ESP32 **keeps watching** instead of ending the episode. A host stopping many services keeps answering its health endpoint for tens of seconds, so "power is back and the host still answers" does not mean the shutdown did not happen. The controller waits up to `SHUTDOWN_CONFIRM_TIMEOUT_MS` (5 minutes) for the host to go down; when it does, Wake-on-LAN is sent immediately because mains is already back.
+- If the host never goes down inside that window, the request genuinely had no effect: the controller returns to idle and records `SHUTDOWN_FAILED` with `extra=3`.
 - A health check only counts as "host is up" when it returns HTTP `2xx`. A `4xx`/`5xx` response is treated as the host not being healthy, so a broken health endpoint cannot keep the controller waiting indefinitely.
 - Shutdown requests are retried every `15 s` for up to 20 attempts. After that the controller backs off to one attempt every 5 minutes and records a `SHUTDOWN_FAILED` event, because the host is still running with power out and continuing to try matters more than giving up.
+- A shutdown request that is **sent but never answered** is not a failure. A host that stops services before replying looks exactly like a timeout, so that case is logged as `Shutdown request sent, no response yet` and the host state decides the outcome. Only a request that could not be delivered, or that was explicitly rejected, records `SHUTDOWN_FAILED` with `extra=0`.
 
 ### Timing characteristics
 
@@ -514,7 +516,10 @@ Reading the reason code:
 | `UPS: Shutdown countdown started (N s)` | Countdown armed after power loss |
 | `UPS: Shutdown cancelled` | Power returned before the countdown expired |
 | `UPS: Shutdown Triggered` | Countdown expired, shutdown API called |
-| `UPS: Shutdown request failed` | Shutdown API call failed; state is confirmed by polling the host |
+| `UPS: Shutdown request was not delivered` | The request could not be sent, or the host rejected it. State is still confirmed by polling the host |
+| `UPS: Shutdown request sent, no response yet; letting the host state decide` | Written and possibly accepted, but the reply timed out. Not treated as a failure |
+| `UPS: Power is back, waiting for the host to finish shutting down` | Mains returned mid-shutdown; the episode stays open until the host goes down |
+| `UPS: Host still reachable N s after the shutdown request, giving up` | Confirm window expired, the shutdown had no effect |
 | `UPS: Host still reachable, retrying shutdown command (N)` | Shutdown retry, `15 s` cadence |
 | `UPS: Host still reachable after 20 shutdown attempts, backing off to every 300 s` | Retry cap reached, switching to the slow cadence |
 | `SHUTDOWN: Health check returned HTTP status = N, treating host as not healthy` | Health endpoint answered but was not `2xx` |
@@ -560,7 +565,7 @@ Notes on `ts`:
 | `POWER_LOST` | Mains power lost |
 | `POWER_RESTORED` | Mains power returned |
 | `SHUTDOWN_TRIGGERED` | Shutdown API called |
-| `SHUTDOWN_FAILED` | Shutdown API call failed |
+| `SHUTDOWN_FAILED` | Shutdown did not take effect. `extra` says why: `0` request not delivered, `1` manual shutdown not delivered, `2` retries exhausted, `3` confirm window expired with the host still up |
 | `SHUTDOWN_CANCELLED` | Countdown cancelled by power restoration |
 | `HOST_DOWN_CONFIRMED` | Host confirmed offline |
 | `HOST_BACK_ONLINE` | Host confirmed online again |
