@@ -65,6 +65,8 @@ Important behavior detail:
 - Shutdown requests are retried every `15 s` for up to 20 attempts. After that the controller backs off to one attempt every 5 minutes and records a `SHUTDOWN_FAILED` event, because the host is still running with power out and continuing to try matters more than giving up.
 - A shutdown request that is **sent but never answered** is not a failure. A host that stops services before replying looks exactly like a timeout, so that case is logged as `Shutdown request sent, no response yet` and the host state decides the outcome. Only a request that could not be delivered, or that was explicitly rejected, records `SHUTDOWN_FAILED` with `extra=0`.
 - A **manual** shutdown (`powerguard/command/force_shutdown`) only wakes the host again if mains is out at the time, or goes out before the shutdown completes. With mains present the host is left off and `host_state` is published as `down`. Wake-on-LAN is decided from why the episode started, not from the current sensor reading.
+- **Wake-on-LAN is retried until it is actually sent.** It cannot be sent at the instant mains returns after a long outage, because the router is rebooting too and there is no route yet. The controller waits for Wi-Fi and re-attempts every 5 s, for up to 10 minutes measured from the first attempt that had a network. A failed send never ends the episode.
+- If the host still has not come back after all wake retries, the controller waits 5 more minutes and then returns to idle, publishing `host_state` as `down`. It stays operable (including for OTA) and the idle probe reports when the host returns later. It does not keep retrying the wake, so use the Force Wake-on-LAN button if the host needs waking again.
 - While idle with the host believed down, the controller probes the health endpoint once a minute purely to report when it comes back. That probe **never** sends Wake-on-LAN, so an intentionally powered-off host stays off.
 - A manual shutdown is **not** preserved across an ESP32 reboot: boot-time recovery still sends Wake-on-LAN when the host is offline and mains is present, because that is how unattended outage recovery works after a controller restart.
 
@@ -398,7 +400,7 @@ Set this in any deployment you care about: without it, any host on the LAN can r
 
 - **Rollback.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is enabled, so an updated image boots in `PENDING_VERIFY` state. `ota_manager_init()` confirms it with `esp_ota_mark_app_valid_cancel_rollback()` as soon as `app_main()` gets past `wifi_manager_init()`. An image that never gets that far is reverted by the bootloader on the next reset.
 - **Boot partition is set last.** `esp_ota_set_boot_partition()` only runs after the whole image is written and validated, so an interrupted transfer leaves the running image bootable.
-- **Power events block updates.** While a shutdown countdown or wake sequence is in progress the upload is rejected with `503 Service Unavailable`, because rebooting the controller would discard that state and the host would neither be shut down nor woken.
+- **Updates are refused only while a shutdown is actually in flight.** `503 Service Unavailable` is returned during the countdown and while waiting for the host to go down, because rebooting the controller there would discard a committed shutdown. During the host-down and waiting-for-host-up states an update **is** accepted: boot-time recovery re-checks the host and re-sends Wake-on-LAN, so a reboot there is recoverable. This matters because a host that stays off would otherwise also prevent updating the controller that is trying to wake it.
 - **One update at a time.** A second concurrent upload is rejected with `503 Service Unavailable`.
 - **Size check.** An image larger than the 1856K slot is rejected with `413` before anything is erased.
 
@@ -529,6 +531,10 @@ Reading the reason code:
 | `SHUTDOWN: Health check returned HTTP status = N, treating host as not healthy` | Health endpoint answered but was not `2xx` |
 | `UPS: Host shutdown confirmed` | Health endpoint stopped responding or stopped returning `2xx` |
 | `UPS: Host is off, waiting for power restoration before Wake-on-LAN` | Shutdown done, waiting for mains |
+| `UPS: Waiting for Wi-Fi before sending Wake-on-LAN` | Mains is back but the network is not, so the packet cannot be sent yet. Retried, not abandoned |
+| `UPS: Failed to send Wake-on-LAN packet, will retry` | Send failed; the episode stays open and retries every 5 s |
+| `UPS: Could not send Wake-on-LAN within 600 s, giving up` | Recovery window expired without ever having a network |
+| `UPS: Host did not come back within 300 s, returning to idle` | All wake retries sent but the host stayed down; the controller settles to idle so it stays operable |
 | `UPS: Host is back online` | Health endpoint recovered after Wake-on-LAN, or was seen online again by the idle probe |
 | `UPS: Startup recovery check: ...` | Boot-time host reconciliation after a reset |
 | `UPS: Startup recovery pending, waiting for Wi-Fi before host check` | Recovery deferred until Wi-Fi returns |
@@ -575,7 +581,7 @@ Notes on `ts`:
 | `HOST_BACK_ONLINE` | Host confirmed online again |
 | `WOL_SENT` | Wake-on-LAN packet sent |
 | `WOL_RETRY` | Wake-on-LAN retry, `extra` is the retry number |
-| `WOL_FAILED` | Wake-on-LAN transmission failed |
+| `WOL_FAILED` | Wake-on-LAN did not work. `extra` says why: `0` the packet could not be sent (typically no network yet), `1` no packet could be sent within the recovery window, `2` the host did not come back after all retries |
 
 ### OTA Logs
 

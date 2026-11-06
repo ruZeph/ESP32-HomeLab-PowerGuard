@@ -49,6 +49,11 @@ typedef struct
        honestly instead of assuming the host is up. */
     bool hostKnownDown;
     TickType_t nextIdleHostCheckTick;
+    /* First wake attempt after mains returns. Wake-on-LAN cannot be sent until
+       the network is back, which after a long outage is later than the power
+       restore edge, so the attempt is retried rather than issued once. */
+    TickType_t wolRecoveryDeadlineTick;
+    bool wolFailureReported;
 } ups_controller_t;
 
 static ups_controller_t ups = {
@@ -96,6 +101,16 @@ static const uint32_t SHUTDOWN_CONFIRM_TIMEOUT_MS = 300000;
 /* Idle health probe cadence, used only while the host is believed to be down.
    This never sends Wake-on-LAN; it only keeps host_state accurate. */
 static const uint32_t IDLE_HOST_CHECK_INTERVAL_MS = 60000;
+
+/* How long to keep retrying Wake-on-LAN after mains returns. A long outage
+   reboots the router too, so the wake cannot be sent at the moment power comes
+   back: there is no route until Wi-Fi re-associates. */
+static const uint32_t WOL_RECOVERY_TIMEOUT_MS = 600000;
+
+/* How long to keep waiting for the host to come back after the wake retries are
+   exhausted. The controller then returns to idle so it stays operable, and the
+   idle probe still reports the host coming up later. */
+static const uint32_t HOST_UP_GIVE_UP_MS = 300000;
 
 /* Remaining seconds most recently published, so the countdown is only sent
    when the value changes. UINT32_MAX means nothing has been published yet. */
@@ -267,19 +282,48 @@ void ups_force_shutdown(void)
 
 static void send_wake_signal(void)
 {
+    /* After a long outage the router is rebooting too, so there is no route at
+       the moment mains returns. Retry instead of failing for good: the episode
+       stays in HOST_DOWN_WAITING_FOR_POWER, which process_host_state() now
+       re-attempts until the packet is actually sent. */
+    if (!wifi_manager_is_connected())
+    {
+        log_host_wait_state("Waiting for Wi-Fi before sending Wake-on-LAN");
+        ups.nextWolRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(WOL_RETRY_INTERVAL_MS);
+        return;
+    }
+
     if (wake_on_lan_send(g_ups_config.wake_mac) != ESP_OK)
     {
-        ESP_LOGW(TAG, "Failed to send Wake-on-LAN packet");
-        event_log_record(EVT_WOL_FAILED, 0);
+        ESP_LOGW(TAG, "Failed to send Wake-on-LAN packet, will retry");
+
+        /* Recorded once per failure streak: retries are frequent and the event
+           ring only holds 30 entries. */
+        if (!ups.wolFailureReported)
+        {
+            event_log_record(EVT_WOL_FAILED, 0);
+            ups.wolFailureReported = true;
+        }
+
+        ups.nextWolRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(WOL_RETRY_INTERVAL_MS);
         return;
+    }
+
+    /* The recovery budget starts at the first attempt that had a network to
+       use, not when mains returned, so a long outage cannot exhaust it. */
+    if (ups.wolRecoveryDeadlineTick == 0)
+    {
+        ups.wolRecoveryDeadlineTick = xTaskGetTickCount() + pdMS_TO_TICKS(WOL_RECOVERY_TIMEOUT_MS);
     }
 
     portENTER_CRITICAL(&s_ups_lock);
     ups.controllerState = CONTROLLER_WAITING_FOR_HOST_UP;
     portEXIT_CRITICAL(&s_ups_lock);
 
+    ups.wolFailureReported = false;
     ups.wolRetriesSent = 1;
     ups.nextWolRetryTick = xTaskGetTickCount() + pdMS_TO_TICKS(WOL_RETRY_INTERVAL_MS);
+    ups.wolRecoveryDeadlineTick = xTaskGetTickCount() + pdMS_TO_TICKS(HOST_UP_GIVE_UP_MS);
     schedule_next_host_check(HOST_CHECK_RETRY_INTERVAL_MS);
     s_last_host_wait_log = NULL;
     mqtt_publish_last_event("WOL sent");
@@ -457,6 +501,15 @@ static void process_host_state(void)
         {
             if (ups.episodeNeedsWake)
             {
+                /* Leave WAITING_FOR_HOST_DOWN before attempting the wake.
+                   Otherwise a failed send keeps the controller here, and the
+                   next poll re-confirms the same shutdown and records
+                   HOST_DOWN_CONFIRMED again every few seconds, filling the
+                   30-event ring with duplicates. */
+                portENTER_CRITICAL(&s_ups_lock);
+                ups.controllerState = CONTROLLER_HOST_DOWN_WAITING_FOR_POWER;
+                portEXIT_CRITICAL(&s_ups_lock);
+
                 ESP_LOGI(TAG, "Power is back, sending Wake-on-LAN");
                 send_wake_signal();
                 return;
@@ -479,12 +532,55 @@ static void process_host_state(void)
         return;
     }
 
+    /* The host is down and waiting for mains. Nothing used to handle this state
+       inside the poll loop: it was left only by the power-restore edge, so a
+       wake that failed at that instant (no route yet, because the router was
+       also rebooting) stranded the controller here forever. Re-attempting the
+       wake from the poll loop makes the state recover on its own. */
+    if (state == CONTROLLER_HOST_DOWN_WAITING_FOR_POWER)
+    {
+        if (power_sensor_read() != POWER_PRESENT)
+        {
+            log_host_wait_state("Host is off, waiting for power restoration before Wake-on-LAN");
+            return;
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        if (now < ups.nextWolRetryTick)
+        {
+            return;
+        }
+
+        if (ups.wolRecoveryDeadlineTick != 0 && now > ups.wolRecoveryDeadlineTick)
+        {
+            ESP_LOGE(TAG, "Could not send Wake-on-LAN within %lu s, giving up",
+                     (unsigned long)(WOL_RECOVERY_TIMEOUT_MS / 1000));
+            portENTER_CRITICAL(&s_ups_lock);
+            ups.controllerState = CONTROLLER_IDLE;
+            portEXIT_CRITICAL(&s_ups_lock);
+            mqtt_publish_last_event("wake failed, host still down");
+            event_log_record(EVT_WOL_FAILED, 1);
+            return;
+        }
+
+        send_wake_signal();
+        return;
+    }
+
     if (state == CONTROLLER_WAITING_FOR_HOST_UP)
     {
         /* Retry WOL periodically in case the first packet was lost */
         TickType_t now = xTaskGetTickCount();
         if (ups.wolRetriesSent < MAX_WOL_RETRIES && now >= ups.nextWolRetryTick)
         {
+            /* Do not spend the retry budget or log events while offline: the
+               packet cannot be sent and this would otherwise flood the ring. */
+            if (!wifi_manager_is_connected())
+            {
+                ups.nextWolRetryTick = now + pdMS_TO_TICKS(WOL_RETRY_INTERVAL_MS);
+                return;
+            }
+
             ESP_LOGI(TAG, "WOL retry %lu/%lu",
                      (unsigned long)(ups.wolRetriesSent + 1),
                      (unsigned long)MAX_WOL_RETRIES);
@@ -507,6 +603,23 @@ static void process_host_state(void)
         if (reachability != HOST_REACHABLE)
         {
             log_host_wait_state("Wake sent, waiting for host health check to come back online");
+
+            /* Give up eventually so the controller is not parked here for
+               ever: that state is not idle, which blocks OTA, and nothing else
+               moves it. */
+            if (ups.wolRetriesSent >= MAX_WOL_RETRIES &&
+                now > ups.wolRecoveryDeadlineTick)
+            {
+                ESP_LOGE(TAG, "Host did not come back within %lu s, returning to idle",
+                         (unsigned long)(HOST_UP_GIVE_UP_MS / 1000));
+                portENTER_CRITICAL(&s_ups_lock);
+                ups.controllerState = CONTROLLER_IDLE;
+                portEXIT_CRITICAL(&s_ups_lock);
+                ups.hostKnownDown = true;
+                s_last_host_wait_log = NULL;
+                mqtt_publish_last_event("host did not come back");
+                event_log_record(EVT_WOL_FAILED, 2);
+            }
             return;
         }
 
@@ -628,7 +741,26 @@ bool ups_is_reboot_safe(void)
     bool safe;
 
     portENTER_CRITICAL(&s_ups_lock);
-    safe = (ups.controllerState == CONTROLLER_IDLE);
+
+    switch (ups.controllerState)
+    {
+    case CONTROLLER_IDLE:
+    case CONTROLLER_HOST_DOWN_WAITING_FOR_POWER:
+    case CONTROLLER_WAITING_FOR_HOST_UP:
+        /* A reboot in these states is recoverable: startup recovery re-checks
+           the host on boot and re-sends Wake-on-LAN if it is still down. This
+           matters operationally, because otherwise a host that stays off also
+           prevents updating the controller that is trying to wake it. */
+        safe = true;
+        break;
+
+    default:
+        /* COUNTDOWN and WAITING_FOR_HOST_DOWN mean a shutdown is in flight;
+           rebooting would lose that. */
+        safe = false;
+        break;
+    }
+
     portEXIT_CRITICAL(&s_ups_lock);
 
     return safe;
@@ -648,6 +780,8 @@ void ups_init(void)
     ups.episodeNeedsWake = false;
     ups.hostKnownDown = false;
     ups.nextIdleHostCheckTick = 0;
+    ups.wolRecoveryDeadlineTick = 0;
+    ups.wolFailureReported = false;
 
     ups.shutdownTimer = xTimerCreate(
         "ups_shutdown",
